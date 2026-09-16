@@ -1,0 +1,21 @@
+{
+  "name": "whatsapp-quick",
+  "version": "0.1.20",
+  "private": true,
+  "description": "Floating keyboard-first WhatsApp palette (self-contained; shares the WhatsApp session with WhatsApp Keyboard Desktop).",
+  "scripts": {
+    "build": "sh scripts/build-macos.sh",
+    "install": "sh scripts/install-macos.sh",
+    "bridge": "node bridge_server.js",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "1.34.7"
+  }
+}

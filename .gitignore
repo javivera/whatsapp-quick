@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# WhatsApp Web runtime state (cache, session/auth data — never commit)
+.wwebjs_cache/
+.wwebjs_auth/
+.wwebjs_media/
+*.session/
+
+# Build output
+src-tauri/target/
+src-tauri/gen/schemas/
+dist/
+build/
+*.app
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+._*
+
+# Logs
+*.log
+npm-debug.log*

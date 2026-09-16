@@ -1,0 +1,528 @@
+:root {
+  --bg: rgba(16, 19, 23, 0.92);
+  --bg-soft: rgba(255, 255, 255, 0.045);
+  --bg-hover: rgba(255, 255, 255, 0.075);
+  --bg-sel: rgba(94, 168, 255, 0.16);
+  --line: rgba(255, 255, 255, 0.09);
+  --fg: #e7eaee;
+  --fg-dim: #98a1ad;
+  --fg-faint: #6d7684;
+  --accent: #5ea8ff;
+  --bubble-in: rgba(255, 255, 255, 0.07);
+  --bubble-out: rgba(94, 168, 255, 0.17);
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --bad: #f87171;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  color: var(--fg);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* Flex column (ytm's layout): the card fills the window exactly. `100vh`
+   can exceed the webview viewport, and in-flow layout lets the parked card
+   create scrollable overflow — either one shows up as a clipped or
+   shifted (misplaced) card. */
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+.hidden { display: none !important; }
+
+.shell {
+  /* Out of flow and pinned to the viewport: while parked below the fold the
+     card must not create scrollable overflow, or any scrollIntoView()/focus()
+     on a row (chat select, composer, search) scrolls the DOCUMENT instead and
+     leaves the whole card permanently shifted up — the misplaced/clipped card
+     bug. A fixed box contributes no document scrollable overflow. */
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 16px 16px 0 0;
+  overflow: hidden;
+  /* ytm's slide: a pure CSS transition on the transform, so the compositor
+     runs it and an interrupted slide reverses smoothly from wherever it is
+     (never a jump, never a flash). */
+  transform: translateY(0);
+  transform-origin: center bottom;
+  transition: transform 0.26s cubic-bezier(0.22, 1, 0.32, 1);
+}
+
+/* Parked state. The native window is NEVER ordered out (that made WebKit
+   drop the layer and repaint in strips on the next show), so the card parks
+   itself below the window instead. The extra 32px covers the slack between
+   the layout height and 100% of the card's own height. */
+body.pre-spawn .shell { transform: translateY(calc(100% + 32px)); }
+
+@media (prefers-reduced-motion: reduce) {
+  .shell { transition: none; }
+}
+
+/* ---------- top bar ---------- */
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+.status i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 8px currentColor;
+  transition: background 160ms ease;
+}
+.status.ready i { background: var(--ok); }
+.status.down i { background: var(--bad); }
+
+.search {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg);
+  font-size: 14px;
+  padding: 3px 2px;
+}
+.search::placeholder { color: var(--fg-faint); }
+
+.hint {
+  flex: 0 0 auto;
+  color: var(--fg-faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+kbd {
+  font: inherit;
+  font-size: 10px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 4px;
+  color: var(--fg-dim);
+}
+
+/* ---------- layout ---------- */
+
+.panes {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+
+.chats {
+  /* Hard-pinned: `min-width: auto` on a flex item resolves to its min-content
+     size, so one unbreakable string (e.g. a base64 blob in a chat preview)
+     would otherwise blow this column out to thousands of pixels and squeeze
+     the thread to nothing. */
+  flex: 0 0 300px;
+  width: 300px;
+  min-width: 300px;
+  max-width: 300px;
+  overflow: hidden;
+  border-right: 1px solid var(--line);
+  position: relative;
+}
+
+.thread { flex: 1 1 auto; min-width: 0; position: relative; }
+
+.list {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 6px;
+  scrollbar-width: thin;
+}
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-faint);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+/* ---------- chat rows ---------- */
+
+.row {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  padding: 7px 8px;
+  border-radius: 9px;
+  min-width: 0;
+  cursor: default;
+}
+.row:hover { background: var(--bg-hover); }
+.row.sel { background: var(--bg-sel); }
+
+.avatar {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: linear-gradient(150deg, #3a4350, #232a33);
+  background-size: cover;
+  background-position: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-dim);
+}
+
+.row-main { flex: 1 1 auto; min-width: 0; }
+
+.row-top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.row-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-time { flex: 0 0 auto; font-size: 10.5px; color: var(--fg-faint); }
+
+.row-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 1px;
+  min-width: 0;
+}
+.row-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-preview.mine { color: var(--fg-faint); }
+
+.badge {
+  flex: 0 0 auto;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #08131f;
+  font-size: 10.5px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ---------- thread ---------- */
+
+.thread-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.thread-name { font-weight: 600; }
+.thread-meta { font-size: 11px; color: var(--fg-faint); }
+
+.messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  scrollbar-width: thin;
+  user-select: text;
+}
+
+.msg {
+  max-width: 78%;
+  padding: 6px 10px;
+  border-radius: 13px;
+  background: var(--bubble-in);
+  align-self: flex-start;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.msg.out { align-self: flex-end; background: var(--bubble-out); }
+.msg.meta { align-self: center; background: none; color: var(--fg-faint); font-size: 11px; padding: 3px 0; }
+.msg.sel { box-shadow: 0 0 0 2px rgba(94, 168, 255, 0.55); }
+.msg.playing .media-chip { color: var(--accent); }
+.msg .rx {
+  display: inline-block;
+  margin-left: 5px;
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  padding: 1px 6px;
+  vertical-align: bottom;
+}
+.msg .rx.mine { background: rgba(94, 168, 255, 0.25); }
+.msg .who { display: block; font-size: 10.5px; font-weight: 650; color: var(--accent); margin-bottom: 1px; }
+.msg .stamp { display: block; font-size: 10px; color: var(--fg-faint); margin-top: 2px; text-align: right; }
+.msg img { max-width: 100%; border-radius: 9px; display: block; }
+.msg img.media-thumb {
+  max-height: 240px;
+  width: auto;
+  height: auto;
+  background: var(--bg-soft);
+}
+.msg img.media-thumb:not(.loaded) {
+  min-width: 120px;
+  min-height: 80px;
+}
+.msg .caption { margin-top: 3px; }
+
+.media-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.media-chip:hover { color: var(--fg); background: var(--bg-hover); }
+
+/* ---------- pane focus indicator ---------- */
+
+/* The scroll panes are real focus targets (tabindex=0 + .focus()), so kill
+   the WebView's native focus outline: otherwise it stacks with our inset
+   ring and reads as a weird double frame. */
+.list:focus,
+.messages:focus {
+  outline: none;
+}
+.list:focus-visible,
+.messages:focus-visible {
+  outline: none;
+}
+
+.shell.pane-chats .chats { box-shadow: inset 0 0 0 2px rgba(94, 168, 255, 0.55); }
+.shell.pane-messages .messages { box-shadow: inset 0 0 0 2px rgba(94, 168, 255, 0.55); }
+.shell.pane-input .composer { box-shadow: inset 0 0 0 2px rgba(94, 168, 255, 0.55); }
+
+/* ---------- composer ---------- */
+
+.composer-banner {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--accent);
+  padding: 3px 2px 0;
+}
+
+/* ---------- message menu ---------- */
+
+.msg-menu {
+  position: absolute;
+  right: 10px;
+  bottom: 58px;
+  min-width: 210px;
+  max-width: 260px;
+  background: rgba(24, 28, 34, 0.97);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 4px;
+  z-index: 10;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+}
+.menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--fg);
+  padding: 7px 10px;
+  border-radius: 7px;
+  font: inherit;
+  cursor: pointer;
+}
+.menu-item.sel { background: var(--bg-sel); }
+.menu-item:hover { background: var(--bg-hover); }
+
+.composer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* Pasted-image strip: thumbnails sit above the text row until sent. */
+.pending-media {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pending-item {
+  position: relative;
+  width: 72px;
+  height: 72px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
+  flex: 0 0 auto;
+}
+.pending-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.pending-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.pending-remove:hover { background: rgba(0, 0, 0, 0.85); }
+.pending-sending {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+#input {
+  flex: 1 1 auto;
+  resize: none;
+  max-height: 108px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  color: var(--fg);
+  font: inherit;
+  padding: 8px 10px;
+  outline: none;
+  overflow-y: auto;
+  /* Autosize grows the box instead of scrolling, so never show a
+     scrollbar gutter inside the single-line composer. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+#input::-webkit-scrollbar { display: none; width: 0; height: 0; }
+#input:focus { border-color: rgba(94, 168, 255, 0.5); }
+#input::placeholder { color: var(--fg-faint); }
+
+.send {
+  flex: 0 0 auto;
+  height: 33px;
+  width: 38px;
+  border-radius: 11px;
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+  font-size: 14px;
+  cursor: pointer;
+}
+.send:hover { color: var(--fg); background: var(--bg-hover); }
+
+/* ---------- toast ---------- */
+
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  background: rgba(248, 113, 113, 0.95);
+  color: #1a0d0d;
+  font-size: 12px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  z-index: 20;
+  max-width: 80%;
+  white-space: pre-wrap;
+}
+
+/* ---------- faults ---------- */
+
+.fault {
+  margin: 8px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  color: #fca5a5;
+  font-size: 11.5px;
+  user-select: text;
+  overflow-wrap: anywhere;
+}
+
+/* scrollbars */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.13); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
+::-webkit-scrollbar-track { background: transparent; }

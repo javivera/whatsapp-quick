@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WhatsApp Quick</title>
+    <link rel="stylesheet" href="./quick.css">
+    <script src="./quick.js" defer></script>
+  </head>
+  <body class="pre-spawn">
+    <div class="shell">
+      <div id="toast" class="toast hidden"></div>
+      <header class="bar" data-tauri-drag-region>
+        <span id="status" class="status" title="Bridge status"><i></i></span>
+        <input
+          id="search"
+          class="search"
+          type="text"
+          placeholder="Search chats…"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Search chats"
+        >
+        <span class="hint"><kbd>⌘L</kbd> search · <kbd>↑↓</kbd> move · <kbd>↵</kbd> open · <kbd>esc</kbd> hide · <span id="build-version">v—</span></span>
+      </header>
+
+      <main class="panes">
+        <section class="col chats" aria-label="Chats">
+          <div id="chat-list" class="list" role="listbox" aria-label="Chats"></div>
+          <p id="chats-empty" class="empty hidden">No chats</p>
+        </section>
+
+        <section class="col thread" aria-label="Conversation">
+          <div id="thread-head" class="thread-head">
+            <span class="thread-name">Pick a chat</span>
+            <span class="thread-meta"></span>
+          </div>
+          <div id="messages" class="messages"></div>
+          <div id="msg-menu" class="msg-menu hidden"></div>
+          <form id="composer" class="composer">
+            <div id="pending-media" class="pending-media hidden" aria-label="Pasted images"></div>
+            <div id="composer-banner" class="composer-banner hidden"></div>
+            <div class="composer-row">
+              <textarea
+                id="input"
+                rows="1"
+                placeholder="Message…"
+                autocomplete="off"
+                spellcheck="false"
+                aria-label="Message"
+              ></textarea>
+              <button id="send" class="send" type="submit" title="Send (Enter)">↵</button>
+            </div>
+          </form>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

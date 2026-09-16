@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "WhatsApp Quick",
+  "version": "0.1.20",
+  "identifier": "com.javivera.whatsappquick",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "WhatsApp Quick",
+        "width": 820,
+        "height": 500,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "visible": false,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "resources": {
+      "../bridge_server.js": "bridge/bridge_server.js",
+      "../package.json": "bridge/package.json",
+      "../package-lock.json": "bridge/package-lock.json",
+      "../node_modules": "bridge/node_modules"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "minimumSystemVersion": "14.0"
+    }
+  }
+}
