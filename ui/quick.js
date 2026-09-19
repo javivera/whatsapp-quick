@@ -9,6 +9,7 @@ const THREAD_POLL_MS = 4000;
 const el = {
   shell: document.querySelector(".shell"),
   status: document.getElementById("status"),
+  viewTag: document.getElementById("view-tag"),
   search: document.getElementById("search"),
   chatList: document.getElementById("chat-list"),
   chatsEmpty: document.getElementById("chats-empty"),
@@ -193,6 +194,10 @@ function visibleChats() {
 function updateSidebarModeUI() {
   el.search.placeholder = state.groupMode ? "Search groups…" : "Search chats…";
   el.chatsEmpty.textContent = state.groupMode ? "No groups" : "No chats";
+  if (el.viewTag) {
+    el.viewTag.textContent = state.groupMode ? "groups" : "main";
+    el.viewTag.classList.toggle("groups", state.groupMode);
+  }
 }
 
 function toggleGroupMode() {
@@ -200,7 +205,6 @@ function toggleGroupMode() {
   state.selected = 0;
   updateSidebarModeUI();
   applyFilter();
-  toast(state.groupMode ? "Groups view — ⌘⇧G for chats" : "Chats view — ⌘⇧G for groups");
 }
 
 async function refreshChats() {
