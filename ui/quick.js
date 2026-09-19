@@ -59,6 +59,7 @@ const state = {
   profilePics: new Map(),
   localReactions: new Map(),
   filter: "",
+  groupMode: false,
   recording: false,
   mediaRecorder: null,
   recordingChunks: [],
@@ -179,18 +180,39 @@ function setStatus(kind) {  el.status.classList.toggle("ready", kind === "ready"
     kind === "ready" ? "Bridge connected" : kind === "down" ? "Bridge unreachable" : "Bridge starting…";
 }
 
+function isGroupChat(c) {
+  if (!c) return false;
+  if (c.is_group) return true;
+  return String(c.id || "").endsWith("@g.us");
+}
+
+function visibleChats() {
+  return state.chats.filter((c) => (state.groupMode ? isGroupChat(c) : !isGroupChat(c)));
+}
+
+function updateSidebarModeUI() {
+  el.search.placeholder = state.groupMode ? "Search groups…" : "Search chats…";
+  el.chatsEmpty.textContent = state.groupMode ? "No groups" : "No chats";
+}
+
+function toggleGroupMode() {
+  state.groupMode = !state.groupMode;
+  state.selected = 0;
+  updateSidebarModeUI();
+  applyFilter();
+  toast(state.groupMode ? "Groups view — ⌘⇧G for chats" : "Chats view — ⌘⇧G for groups");
+}
+
 async function refreshChats() {
   if (state.inflight) return;
   state.inflight = true;
   try {
     const payload = await invoke("bridge_get_chats", {
       limit: CHAT_LIMIT,
-      includeGroups: false,
+      includeGroups: true,
       query: null,
     });
-    const chats = (Array.isArray(payload && payload.chats) ? payload.chats : []).filter(
-      (c) => !c.is_group,
-    );
+    const chats = Array.isArray(payload && payload.chats) ? payload.chats : [];
     state.chats = chats;
     state.bridgeReady = true;
     setStatus("ready");
@@ -212,7 +234,7 @@ async function openChat(chatId) {
   if (state.filter !== "") {
     el.search.value = "";
     state.filter = "";
-    state.filtered = state.chats.filter((c) => !c.is_group);
+    state.filtered = visibleChats();
   }
   const openedIdx = state.filtered.findIndex((c) => c.id === chatId);
   if (openedIdx >= 0) state.selected = openedIdx;
@@ -307,12 +329,12 @@ async function refreshThread() {
 
 function applyFilter() {
   const q = state.filter.trim().toLowerCase();
-  // Sidebar is DMs only: never show group chats (@g.us / is_group).
-  const dms = state.chats.filter((c) => !c.is_group);
+  // Sidebar shows one view at a time: DMs by default, groups when toggled.
+  const base = visibleChats();
   if (!q) {
-    state.filtered = dms;
+    state.filtered = base;
   } else {
-    state.filtered = dms.filter((c) =>
+    state.filtered = base.filter((c) =>
       `${c.name || ""} ${c.id || ""}`.toLowerCase().includes(q),
     );
   }
@@ -1555,6 +1577,12 @@ document.addEventListener("keydown", (event) => {
     else startRecording();
     return;
   }
+  if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "g") {
+    // Toggle sidebar between DMs and groups.
+    event.preventDefault();
+    toggleGroupMode();
+    return;
+  }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
 
   if (state.recording) {
@@ -1896,6 +1924,7 @@ async function boot() {
     });
   }
   renderThreadHead(null);
+  updateSidebarModeUI();
   // Show the real bundle version so the running build is identifiable.
   try {
     const v = await window.__TAURI__.app.getVersion();
