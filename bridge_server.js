@@ -2690,6 +2690,7 @@ async function downloadMediaWithRetry(chatId, messageId) {
       console.warn(
         `[bridge] downloadMedia(${messageId}) attempt ${attempt}/${MEDIA_DOWNLOAD_MAX_ATTEMPTS} not ready: ${result?.error || "unknown"}` +
         (result?.stage ? ` (stage=${result.stage})` : "") +
+        (result?.detail ? ` (${result.detail})` : "") +
         (result?.hasDirectPath === false ? " (no directPath)" : ""),
       );
     } catch (err) {
@@ -2743,6 +2744,10 @@ async function handleMedia(urlObj, res) {
         success: false,
         error: transient ? "Media is not available yet, try again shortly" : "Failed to download media",
         code: media?.error || "unknown",
+        // Which branch failed: stage=REUPLOADING/ERROR_MISSING = media gone,
+        // detail = decrypt error (e.g. the mimetype allowlist rejection).
+        stage: media?.stage || "",
+        detail: media?.detail || "",
       });
       return;
     }
@@ -2811,10 +2816,15 @@ async function downloadMediaDirectFromStore(chatId, messageId) {
     if (!hasMedia) return { error: "no_media" };
 
     const mediaStage = message.mediaData?.mediaStage || "";
+    // WhatsApp Web's download manager defaults `mimetype` to
+    // "application/octet-stream" and then rejects that value against the
+    // per-msg-type allowlist (InvalidMediaFileType), so pass the real one.
+    const declaredMimetype = String(message.mimetype || message.mediaData?.mimetype || "").trim();
     const mediaDiagnostics = {
       stage: mediaStage,
       hasDirectPath: Boolean(message.directPath),
       hasMediaKey: Boolean(message.mediaKey),
+      mimetype: declaredMimetype,
     };
 
     if (!message.mediaData || mediaStage === "REUPLOADING") {
@@ -2871,6 +2881,8 @@ async function downloadMediaDirectFromStore(chatId, messageId) {
         mediaKey: message.mediaKey,
         mediaKeyTimestamp: message.mediaKeyTimestamp,
         type: message.type,
+        // Omitted when unknown so WhatsApp Web's own default still applies.
+        ...(declaredMimetype ? { mimetype: declaredMimetype } : {}),
         signal: (new AbortController()).signal,
         downloadQpl: mockQpl,
       });

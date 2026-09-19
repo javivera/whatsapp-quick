@@ -20,6 +20,9 @@ const el = {
   pendingMedia: document.getElementById("pending-media"),
   input: document.getElementById("input"),
   send: document.getElementById("send"),
+  mic: document.getElementById("mic"),
+  recordBanner: document.getElementById("record-banner"),
+  recordTimer: document.getElementById("record-timer"),
   toast: document.getElementById("toast"),
 };
 
@@ -50,9 +53,17 @@ const state = {
   lastThreadAt: 0,
   mediaCache: new Map(),
   mediaLoadsInFlight: new Map(),
+  // messageId -> { attempts, nextAt } for media that failed to load, so a
+  // failed thumbnail is retried (with backoff) instead of staying broken.
+  mediaFailures: new Map(),
   profilePics: new Map(),
   localReactions: new Map(),
   filter: "",
+  recording: false,
+  mediaRecorder: null,
+  recordingChunks: [],
+  recordingStartTime: 0,
+  recordingTimerInterval: null,
 };
 
 function invoke(command, args = {}) {
@@ -274,6 +285,9 @@ async function refreshThread() {
       state.lastThreadKey = key;
       renderMessages(shouldScroll);
     }
+    // The early-out above means a media load that failed once would never be
+    // retried by a poll; retry the failed thumbnails directly on the DOM.
+    retryDueMedia();
     // While the chat is open on screen it counts as read: clear any badge
     // (fires at most once per batch of new arrivals, since it zeroes the
     // count optimistically).
@@ -424,11 +438,12 @@ function renderMessages(scrollToEnd) {
     }
 
     if (isChat) {
-      node.append(document.createTextNode(clamp(msg.body, 4000)));
+      node.append(renderBodyWithLinks(msg));
     } else if (type === "image" || type === "video" || type === "sticker") {
       const cached = state.mediaCache.get(msg.id);
       const thumb = document.createElement("img");
       thumb.className = "media-thumb";
+      thumb.dataset.msgId = msg.id;
       thumb.alt = type === "video" ? "video" : "photo";
       thumb.loading = "lazy";
       // Late-loading media expands the thread after the initial
@@ -441,7 +456,8 @@ function renderMessages(scrollToEnd) {
         thumb.src = cached.src;
         thumb.classList.add("loaded");
       } else {
-        thumb.src = "data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=";
+        thumb.src = TRANSPARENT_PIXEL;
+        if (state.mediaFailures.has(msg.id)) markThumbFailed(thumb, msg.id);
         ensureMediaThumb(msg.id, thumb);
       }
       node.append(thumb);
@@ -456,10 +472,10 @@ function renderMessages(scrollToEnd) {
       chip.className = "media-chip";
       const label = playing ? "🔊 playing" : `${isAudioType(msg) ? "▶ " : "▸ "}${mediaLabel(msg)}`;
       chip.textContent = label;
-      chip.title = msg.title || msg.filename || (isAudioType(msg) ? "Play" : "Load");
+      chip.title = msg.title || msg.filename || (isAudioType(msg) ? "Play" : "Open");
       chip.addEventListener("click", () => {
         if (isAudioType(msg)) playAudio(msg);
-        else loadMedia(msg, node);
+        else openMediaExternally(msg);
       });
       node.append(chip);
       if (msg.body) {
@@ -517,6 +533,12 @@ function isNearBottom(px = 80) {
 }
 
 const MEDIA_CACHE_LIMIT = 60;
+// A real 1x1 transparent PNG: the old placeholder was a truncated GIF that
+// WebKit refuses to decode, so unloaded photos showed a broken-image glyph.
+const TRANSPARENT_PIXEL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+// Retry a failed media load a few times with backoff before showing "unavailable".
+const MEDIA_RETRY_ATTEMPT_DELAYS_MS = [1000, 3000, 8000, 20000];
 
 function cacheMediaEntry(messageId, entry) {
   if (state.mediaCache.has(messageId)) state.mediaCache.delete(messageId);
@@ -553,6 +575,7 @@ async function fetchMediaSrc(messageId) {
     }
     if (!src) throw new Error("no renderable media data");
     cacheMediaEntry(messageId, { kind, src });
+    state.mediaFailures.delete(messageId);
     return src;
   })();
 
@@ -564,12 +587,76 @@ async function fetchMediaSrc(messageId) {
   }
 }
 
+function nextMediaRetryDelay(attempts) {
+  const index = Math.min(attempts - 1, MEDIA_RETRY_ATTEMPT_DELAYS_MS.length - 1);
+  return MEDIA_RETRY_ATTEMPT_DELAYS_MS[Math.max(0, index)];
+}
+
+function isMediaRetryDue(messageId) {
+  const failure = state.mediaFailures.get(messageId);
+  return !failure || Date.now() >= failure.nextAt;
+}
+
+function markThumbFailed(imgEl, messageId) {
+  const failure = state.mediaFailures.get(messageId);
+  if (!failure) return;
+  imgEl.classList.add("media-failed");
+  imgEl.title = "Photo not loaded yet — click to retry";
+  const exhausted = failure.attempts > MEDIA_RETRY_ATTEMPT_DELAYS_MS.length;
+  imgEl.alt = exhausted ? "photo unavailable" : "photo";
+  if (imgEl.dataset.retryBound === "1") return;
+  imgEl.dataset.retryBound = "1";
+  imgEl.addEventListener("click", () => {
+    // Manual retry always wins: clear the backoff and try again now.
+    state.mediaFailures.delete(messageId);
+    imgEl.classList.remove("media-failed");
+    imgEl.alt = "photo";
+    ensureMediaThumb(messageId, imgEl);
+  });
+}
+
+function recordMediaFailure(messageId) {
+  const previous = state.mediaFailures.get(messageId);
+  const attempts = (previous ? previous.attempts : 0) + 1;
+  state.mediaFailures.set(messageId, {
+    attempts,
+    nextAt: Date.now() + nextMediaRetryDelay(attempts),
+  });
+  return state.mediaFailures.get(messageId);
+}
+
+/**
+ * Retry media that failed earlier: thread polls used to skip re-rendering when
+ * nothing but the media changed, so one transient bridge failure left a photo
+ * broken forever. Only touches unloaded images whose backoff has elapsed.
+ */
+function retryDueMedia() {
+  const thumbs = el.messages.querySelectorAll("img.media-thumb[data-msg-id]");
+  for (const imgEl of thumbs) {
+    const messageId = imgEl.dataset.msgId;
+    if (!messageId || imgEl.classList.contains("loaded")) continue;
+    // A cache hit whose image element never got it (re-render race) is applied
+    // straight away instead of being skipped forever.
+    const cached = state.mediaCache.get(messageId);
+    if (cached && cached.src) {
+      imgEl.src = cached.src;
+      imgEl.classList.add("loaded");
+      imgEl.classList.remove("media-failed");
+      continue;
+    }
+    if (state.mediaLoadsInFlight.has(messageId)) continue;
+    if (!isMediaRetryDue(messageId)) continue;
+    ensureMediaThumb(messageId, imgEl);
+  }
+}
+
 async function ensureMediaThumb(messageId, imgEl) {
   try {
     const src = await fetchMediaSrc(messageId);
     if (imgEl.isConnected) {
       imgEl.src = src;
       imgEl.classList.add("loaded");
+      imgEl.classList.remove("media-failed");
       // The `load` listener added in renderMessages fires here and re-pins
       // to the bottom. Fall back to an explicit check in case the event
       // was missed (e.g. cached data URL resolving synchronously).
@@ -578,19 +665,10 @@ async function ensureMediaThumb(messageId, imgEl) {
       }
     }
   } catch (_) {
-    // Keep the placeholder; the next poll retries.
-  }
-}
-
-async function loadMedia(msg, node) {
-  const chip = node.querySelector(".media-chip");
-  if (chip) chip.textContent = "loading…";
-  try {
-    const src = await fetchMediaSrc(msg.id);
-    if (!src) throw new Error("no media data");
-    renderMessages(false);
-  } catch (err) {
-    if (chip) chip.textContent = "media unavailable";
+    // Keep the placeholder but remember the failure: the next thread poll
+    // retries it (see retryDueMedia) and a click retries it immediately.
+    recordMediaFailure(messageId);
+    if (imgEl.isConnected) markThumbFailed(imgEl, messageId);
   }
 }
 
@@ -632,6 +710,278 @@ async function playAudio(msg) {
   }
 }
 
+/* ---------------- links & opening media externally ---------------- */
+
+function cleanupUrlCandidate(value) {
+  return String(value || "").trim().replace(/[)\],.!?:;]+$/g, "");
+}
+
+function extractMessageUrls(msg) {
+  const direct = Array.isArray(msg.links)
+    ? msg.links.map(cleanupUrlCandidate).filter(Boolean)
+    : [];
+  if (direct.length) return direct;
+  const body = String(msg.body || "");
+  const matches = body.match(/https?:\/\/[^\s<>"'`]+/gi) || [];
+  return matches.map(cleanupUrlCandidate).filter(Boolean);
+}
+
+function primaryMessageUrl(msg) {
+  return extractMessageUrls(msg)[0] || "";
+}
+
+function hasOpenableMedia(msg) {
+  if (!msg.has_media) return false;
+  const type = String(msg.type || "").toLowerCase();
+  return ![
+    "audio", "ptt", "sticker", "location", "live_location", "vcard", "multi_vcard",
+  ].includes(type);
+}
+
+function linkHost(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch (_) {
+    return url;
+  }
+}
+
+function openLink(url) {
+  invoke("open_url", { url })
+    .then(() => toast(`Opened ${linkHost(url)}`))
+    .catch((err) => toast("Open failed: " + (err && err.message ? err.message : err)));
+}
+
+async function openMediaExternally(msg) {
+  toast("Opening…");
+  try {
+    const payload = await invoke("bridge_get_media", {
+      chatId: state.activeChatId,
+      messageId: msg.id,
+    });
+    const data = payload && payload.data;
+    if (!data) throw new Error("no media data");
+    await invoke("open_media_external", {
+      data,
+      mimetype: payload.mimetype || "application/octet-stream",
+      filename: payload.filename || msg.filename || "",
+    });
+  } catch (err) {
+    toast("Open failed: " + (err && err.message ? err.message : err));
+  }
+}
+
+/**
+ * Enter on a selected message does the obvious thing: play a voice note,
+ * open a link in the browser, or open an image/video/document in the OS
+ * default app. Plain text messages fall back to the action menu.
+ */
+function performPrimaryAction(msg) {
+  if (!msg) return;
+  if (isAudioType(msg)) {
+    playAudio(msg);
+    return;
+  }
+  const linkUrl = primaryMessageUrl(msg);
+  if (linkUrl && !msg.has_media) {
+    openLink(linkUrl);
+    return;
+  }
+  if (hasOpenableMedia(msg)) {
+    openMediaExternally(msg);
+    return;
+  }
+  openMenuForSelected();
+}
+
+/** Render a chat body with its URLs as clickable links. */
+function renderBodyWithLinks(msg) {
+  const body = clamp(msg.body, 4000);
+  const frag = document.createDocumentFragment();
+  const pattern = /https?:\/\/[^\s<>"'`]+/gi;
+  let lastIndex = 0;
+  let match;
+  while ((match = pattern.exec(body)) !== null) {
+    const before = body.slice(lastIndex, match.index);
+    if (before) frag.append(document.createTextNode(before));
+    const rawUrl = match[0];
+    const cleanUrl = cleanupUrlCandidate(rawUrl);
+    const a = document.createElement("a");
+    a.className = "msg-link";
+    a.textContent = cleanUrl;
+    a.title = "Open in browser";
+    a.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openLink(cleanUrl);
+    });
+    frag.append(a);
+    lastIndex = match.index + cleanUrl.length;
+  }
+  const tail = body.slice(lastIndex);
+  if (tail) frag.append(document.createTextNode(tail));
+  return frag;
+}
+
+/* ---------------- voice recording ---------------- */
+
+function updateRecordingTimer() {
+  if (!state.recordingStartTime) return;
+  const elapsed = Math.floor((Date.now() - state.recordingStartTime) / 1000);
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = String(elapsed % 60).padStart(2, "0");
+  el.recordTimer.textContent = `${minutes}:${seconds}`;
+}
+
+function showRecordingBanner() {
+  el.recordBanner.classList.remove("hidden");
+  el.mic.classList.add("recording");
+  updateRecordingTimer();
+}
+
+function hideRecordingBanner() {
+  el.recordBanner.classList.add("hidden");
+  el.mic.classList.remove("recording");
+  if (state.recordingTimerInterval) {
+    clearInterval(state.recordingTimerInterval);
+    state.recordingTimerInterval = null;
+  }
+}
+
+async function waitForLiveAudioTrack(stream, { timeoutMs = 1200 } = {}) {
+  const [track] = Array.from(stream?.getAudioTracks?.() || []);
+  if (!track) return;
+  if (track.readyState === "live" && !track.muted) return;
+
+  await new Promise((resolve) => {
+    let settled = false;
+    let timer = 0;
+
+    const cleanup = () => {
+      if (timer) window.clearTimeout(timer);
+      track.removeEventListener("unmute", handleReady);
+      track.removeEventListener("ended", handleReady);
+    };
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+
+    const handleReady = () => finish();
+
+    track.addEventListener("unmute", handleReady, { once: true });
+    track.addEventListener("ended", handleReady, { once: true });
+    timer = window.setTimeout(finish, timeoutMs);
+  });
+}
+
+async function startRecording() {
+  if (state.recording) return;
+  if (!state.activeChatId) {
+    toast("Open a chat first, then record");
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    await waitForLiveAudioTrack(stream);
+
+    let mimeType = "audio/ogg; codecs=opus";
+    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "audio/webm; codecs=opus";
+    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "audio/webm";
+    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "";
+
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    state.recordingChunks = [];
+
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) state.recordingChunks.push(event.data);
+    };
+    recorder.onstop = () => stream.getTracks().forEach((track) => track.stop());
+    recorder.start(100);
+
+    state.mediaRecorder = recorder;
+    state.recording = true;
+    state.recordingStartTime = Date.now();
+    state.recordingTimerInterval = setInterval(updateRecordingTimer, 500);
+    showRecordingBanner();
+    setPane("input");
+  } catch (err) {
+    toast("Microphone unavailable: " + (err && err.message ? err.message : err));
+  }
+}
+
+function cancelRecording() {
+  if (!state.recording) return;
+  const recorder = state.mediaRecorder;
+  state.recording = false;
+  state.recordingChunks = [];
+  state.recordingStartTime = 0;
+  state.mediaRecorder = null;
+  hideRecordingBanner();
+  if (recorder && recorder.state !== "inactive") {
+    try {
+      recorder.stop();
+    } catch (_) {
+      /* already stopped */
+    }
+  }
+}
+
+async function stopAndSendRecording() {
+  if (!state.recording || !state.mediaRecorder) return;
+  const recorder = state.mediaRecorder;
+  const mimeType = recorder.mimeType || "audio/ogg; codecs=opus";
+  const chatId = state.activeChatId;
+
+  state.recording = false;
+  state.recordingStartTime = 0;
+  state.mediaRecorder = null;
+  hideRecordingBanner();
+
+  await new Promise((resolve) => {
+    const previous = recorder.onstop;
+    recorder.onstop = () => {
+      if (previous) previous();
+      resolve();
+    };
+    try {
+      recorder.stop();
+    } catch (_) {
+      resolve();
+    }
+  });
+
+  const chunks = state.recordingChunks;
+  state.recordingChunks = [];
+  if (!chunks.length) {
+    toast("No audio recorded");
+    return;
+  }
+  const blob = new Blob(chunks, { type: mimeType });
+  if (blob.size < 100) {
+    toast("Recording too short");
+    return;
+  }
+
+  const base64 = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+    reader.onerror = () => reject(new Error("could not read recording"));
+    reader.readAsDataURL(blob);
+  });
+
+  try {
+    await invoke("bridge_send_audio", { chatId, audioData: base64, mimetype: mimeType });
+    toast("Voice note sent");
+    await refreshThread();
+  } catch (err) {
+    toast("Send failed: " + (err && err.message ? err.message : err));
+  }
+}
+
 /* ---------------- composer modes (edit / reply) ---------------- */
 
 function updateComposerBanner() {
@@ -669,6 +1019,7 @@ function startEdit(msg) {
 }
 
 async function send() {
+  if (state.recording) return;
   const text = el.input.value.trim();
   const pending = state.pendingMedia.slice();
   if ((!text && pending.length === 0) || !state.activeChatId) return;
@@ -791,6 +1142,15 @@ function fallbackCopy(text) {
 /* ---------------- pasted images (Cmd+V) ---------------- */
 
 const PASTE_MAX_ITEMS = 5;
+// Photo types WhatsApp renders as-is; anything else (macOS clipboard images can
+// arrive as TIFF/BMP) is re-encoded before sending.
+const PASTE_PASSTHROUGH_MIMETYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/webp",
+  "image/gif",
+]);
 let pendingMediaKey = 0;
 
 function guessExtension(mimetype, filename) {
@@ -844,6 +1204,42 @@ function readFileAsDataUrl(file) {
   });
 }
 
+/**
+ * Re-encode a clipboard image through a canvas so the photo is a real PNG:
+ * WhatsApp only renders the web image types, so a pasted TIFF/BMP would send
+ * but never display. Keeps the original bytes when decoding fails.
+ */
+async function preparePastedImage({ dataUrl, data, mimetype, filename }) {
+  if (PASTE_PASSTHROUGH_MIMETYPES.has(String(mimetype).toLowerCase())) {
+    return { data, mimetype, filename, previewUrl: dataUrl };
+  }
+
+  try {
+    const image = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("could not decode pasted image"));
+      img.src = dataUrl;
+    });
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    if (!width || !height) throw new Error("pasted image has no pixels");
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext("2d").drawImage(image, 0, 0);
+    const pngDataUrl = canvas.toDataURL("image/png");
+    return {
+      data: pngDataUrl.slice(pngDataUrl.indexOf(",") + 1),
+      mimetype: "image/png",
+      filename: `${String(filename).replace(/\.[^.]+$/, "")}.png`,
+      previewUrl: pngDataUrl,
+    };
+  } catch (_) {
+    return { data, mimetype, filename, previewUrl: dataUrl };
+  }
+}
+
 async function addPastedFiles(files) {
   const images = (Array.isArray(files) ? files : [...files]).filter(
     (f) => f && String(f.type || "").startsWith("image/"),
@@ -878,12 +1274,13 @@ async function addPastedFiles(files) {
         (file.name && String(file.name).includes("."))
           ? file.name
           : `pasted-image-${Date.now()}.${ext}`;
+      const prepared = await preparePastedImage({ dataUrl, data, mimetype, filename });
       state.pendingMedia.push({
         key: ++pendingMediaKey,
-        mimetype,
-        data,
-        filename,
-        previewUrl: dataUrl,
+        mimetype: prepared.mimetype,
+        data: prepared.data,
+        filename: prepared.filename,
+        previewUrl: prepared.previewUrl,
       });
     } catch (err) {
       toast("Paste failed: " + (err && err.message ? err.message : err));
@@ -1151,7 +1548,27 @@ document.addEventListener("keydown", (event) => {
     }
     return;
   }
+  if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "m") {
+    // Toggle voice recording (start, or stop + send while recording).
+    event.preventDefault();
+    if (state.recording) stopAndSendRecording();
+    else startRecording();
+    return;
+  }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+  if (state.recording) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelRecording();
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      stopAndSendRecording();
+      return;
+    }
+  }
 
   if (state.menuOpen) {
     handleMenuKey(event);
@@ -1263,6 +1680,12 @@ document.addEventListener("keydown", (event) => {
     }
     if (event.key === "Enter") {
       event.preventDefault();
+      const msg = state.messages.find((m) => m.id === state.selectedMsgId);
+      performPrimaryAction(msg);
+      return;
+    }
+    if (event.key === "m") {
+      event.preventDefault();
       openMenuForSelected();
       return;
     }
@@ -1361,6 +1784,11 @@ el.input.addEventListener("focus", () => {
 });
 
 el.input.addEventListener("input", autosize);
+
+el.mic.addEventListener("click", () => {
+  if (state.recording) stopAndSendRecording();
+  else startRecording();
+});
 
 /* ---------------- lifecycle ---------------- */
 

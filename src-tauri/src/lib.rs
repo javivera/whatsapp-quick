@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::{blocking::Client as BlockingClient, Client as AsyncClient};
 use serde_json::{json, Value};
 use std::fs;
@@ -20,9 +21,31 @@ const DEFAULT_SHORTCUT: &str = "Command+Shift+M";
 /// without activating the app, not the user clicking away.
 const BLUR_GRACE_MS: u64 = 700;
 
+/// Markers identifying the full WhatsApp Keyboard Desktop app. It shares
+/// bridge port 8787: while it is running, its bridge is left strictly alone.
+/// Anything else holding our port with no live owner is an orphan this app
+/// may reclaim automatically.
+const FULL_APP_CMD_MARKERS: [&str; 2] =
+    ["WhatsApp Keyboard Desktop.app", "whatsapp_keyboard_desktop"];
+
+/// Latency-bounded probe client. The watchdog and heal paths must never block
+/// longer than this on a wedged bridge.
+const PROBE_TIMEOUT_SECS: u64 = 4;
+/// How often the background watchdog checks the bridge behind our back.
+const WATCHDOG_INTERVAL_SECS: u64 = 30;
+/// A bridge spawned less than this long ago is still booting (503s, refused
+/// connections) and must not be mistaken for wedged.
+const SPAWN_GRACE_SECS: u64 = 60;
+
 struct AppState {
     bridge_process: Mutex<Option<Child>>,
     pending_deep_link: Mutex<Option<String>>,
+    /// When this process last spawned a bridge. Reclaim logic leaves a
+    /// fresh spawn alone while WhatsApp Web boots.
+    bridge_spawned_at: Mutex<Option<Instant>>,
+    /// Serialises heal/reclaim runs (ensure_bridge, watchdog, sleep-wake)
+    /// so two triggers can't stack competing kill+spawn cycles.
+    heal_lock: Mutex<()>,
 }
 
 struct OverlayState {
@@ -84,6 +107,7 @@ fn should_restart_bridge(payload: &Value) -> bool {
 }
 
 static HEALTH_HTTP_CLIENT: OnceLock<BlockingClient> = OnceLock::new();
+static PROBE_HTTP_CLIENT: OnceLock<BlockingClient> = OnceLock::new();
 static ASYNC_HTTP_CLIENT: OnceLock<AsyncClient> = OnceLock::new();
 static ASYNC_HEALTH_HTTP_CLIENT: OnceLock<AsyncClient> = OnceLock::new();
 
@@ -155,6 +179,7 @@ async fn parse_json_response_async(response: reqwest::Response) -> Result<Value,
     Ok(payload)
 }
 
+#[allow(dead_code)]
 fn bridge_get_health_check(path: &str) -> Result<Value, String> {
     let request_path = if path == "/health" {
         format!("{path}?strict=true")
@@ -248,6 +273,116 @@ fn resolve_bridge_paths(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), St
     }
 
     Err("Could not locate bridge_server.js".to_string())
+}
+
+/// Resolve the directory holding the frontend assets (index.html, quick.js,
+/// quick.css). In a release bundle the files are copied under `Resources/ui`;
+/// during development they sit at `<project_root>/ui`.
+fn resolve_ui_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Some(resource_root) = resource_dir(app) {
+        let bundled_ui = resource_root.join("ui");
+        if bundled_ui.join("index.html").is_file() {
+            return Ok(bundled_ui);
+        }
+    }
+
+    let compile_time = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("ui"))
+        .unwrap_or_default();
+    if compile_time.join("index.html").is_file() {
+        return Ok(compile_time);
+    }
+
+    Err("Could not locate the ui/ directory with index.html".to_string())
+}
+
+fn mime_for_path(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") | Some("mjs") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("wav") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("webm") => "audio/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Spawn a tiny_http server on an OS-assigned port serving the UI directory.
+///
+/// The page MUST load from `http://localhost:<port>` (not Tauri's
+/// `tauri://localhost` asset protocol) because that asset protocol is not a
+/// secure context on macOS WKWebView, and `navigator.mediaDevices.getUserMedia`
+/// (microphone, for voice notes) only exists in a secure context.
+fn spawn_asset_server(ui_dir: PathBuf) -> Result<u16, String> {
+    // Binding port 0 lets the OS pick and reserve the port atomically.
+    let addr = "127.0.0.1:0";
+    let server = tiny_http::Server::http(addr)
+        .map_err(|e| format!("Failed to start asset server on {addr}: {e}"))?;
+    let port = server
+        .server_addr()
+        .to_ip()
+        .ok_or("Asset server did not bind an IP socket")?
+        .port();
+
+    println!("[asset-server] Serving {ui_dir:?} on http://localhost:{port}");
+
+    std::thread::spawn(move || {
+        for request in server.incoming_requests() {
+            let url_path = request.url().to_string();
+            let clean = url_path.split('?').next().unwrap_or("/");
+            let relative = if clean == "/" { "/index.html" } else { clean };
+            let relative = relative.trim_start_matches('/');
+            let file_path = ui_dir.join(relative);
+
+            if file_path.is_file() {
+                match std::fs::File::open(&file_path) {
+                    Ok(mut file) => {
+                        let mut buf = Vec::new();
+                        if std::io::Read::read_to_end(&mut file, &mut buf).is_ok() {
+                            let content_type = mime_for_path(&file_path);
+                            let header = tiny_http::Header::from_bytes(
+                                b"Content-Type",
+                                content_type.as_bytes(),
+                            )
+                            .unwrap();
+                            let response =
+                                tiny_http::Response::from_data(buf).with_header(header);
+                            let _ = request.respond(response);
+                        } else {
+                            let _ = request.respond(
+                                tiny_http::Response::from_string("Read error")
+                                    .with_status_code(500),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        let _ = request.respond(
+                            tiny_http::Response::from_string("Not found").with_status_code(404),
+                        );
+                    }
+                }
+            } else {
+                let _ = request.respond(
+                    tiny_http::Response::from_string("Not found").with_status_code(404),
+                );
+            }
+        }
+    });
+
+    Ok(port)
 }
 
 fn command_exists_in_path(command: &str) -> bool {
@@ -383,6 +518,10 @@ fn spawn_bridge_if_needed(state: &AppState, app: &tauri::AppHandle) -> Result<()
         .map_err(|err| format!("Failed to start bridge process: {err}"))?;
 
     *guard = Some(child);
+    drop(guard);
+    if let Ok(mut at) = state.bridge_spawned_at.lock() {
+        *at = Some(Instant::now());
+    }
     Ok(())
 }
 
@@ -455,7 +594,10 @@ fn stop_bridge_process(state: &AppState) {
             for pid in descendant_pids.iter().rev() {
                 terminate_pid(&sys, *pid);
             }
-            let _ = child.wait();
+            // Never block here: a starved bridge ignores SIGTERM, so wait()
+            // would stall the caller (notably reclaim) forever. Survivors
+            // are SIGKILLed by the caller's terminate_pids/sweep.
+            let _ = child.try_wait();
         }
         *guard = None;
     }
@@ -472,70 +614,269 @@ fn owns_bridge(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
-/// Reachability probe that succeeds on ANY HTTP response, including the 503 a
-/// bridge returns while WhatsApp Web is still booting. Used to decide whether a
-/// bridge already exists before spawning a competitor on the same port.
-fn bridge_reachable() -> Option<Value> {
-    let client = health_http_client().ok()?;
-    let response = client
-        .get(format!("{}/health", bridge_base_url()))
+/// True while the full WhatsApp app is alive. Its bridge is never touched.
+fn full_app_running() -> bool {
+    let mut sys = System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    sys.processes().values().any(|process| {
+        let name = process.name().to_string_lossy().to_lowercase();
+        if name.contains("whatsapp_keyboard_desktop") {
+            return true;
+        }
+        process.cmd().iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            FULL_APP_CMD_MARKERS.iter().any(|marker| arg.contains(marker))
+        })
+    })
+}
+
+/// Pids of node processes running a bridge_server.js copy: the processes that
+/// can hold our shared port. Includes orphans from previously crashed owners.
+fn bridge_holder_pids() -> Vec<u32> {
+    let mut sys = System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    sys.processes()
+        .values()
+        .filter(|process| {
+            process.name().to_string_lossy() == "node"
+                && process
+                    .cmd()
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains("bridge_server.js"))
+        })
+        .map(|process| process.pid().as_u32())
+        .collect()
+}
+
+/// Pids of headless Chrome helpers bound to the shared session-gui profile.
+/// A stale set holds the profile lock and blocks a fresh bridge's browser.
+fn session_chrome_pids() -> Vec<u32> {
+    let mut sys = System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    sys.processes()
+        .values()
+        .filter(|process| {
+            let name = process.name().to_string_lossy().to_lowercase();
+            name.contains("chrome")
+                && process
+                    .cmd()
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains("session-gui"))
+        })
+        .map(|process| process.pid().as_u32())
+        .collect()
+}
+
+/// TERM, wait briefly, then KILL whatever remains. Works on stopped (SIGSTOP)
+/// and event-loop-starved processes that ignore graceful shutdown.
+fn terminate_pids(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    let mut sys = System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    let targets: Vec<Pid> = pids.iter().map(|id| Pid::from_u32(*id)).collect();
+    for pid in &targets {
+        if let Some(process) = sys.process(*pid) {
+            let _ = process.kill_with(Signal::Term);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        std::thread::sleep(Duration::from_millis(150));
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All);
+        let alive: Vec<Pid> = targets
+            .iter()
+            .copied()
+            .filter(|pid| sys.process(*pid).is_some())
+            .collect();
+        if alive.is_empty() || Instant::now() >= deadline {
+            for pid in alive {
+                if let Some(process) = sys.process(pid) {
+                    let _ = process.kill();
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// Kill bridge/Chrome strays from dead owners so the next spawn owns a clean
+/// slate. No-op while the full app runs: its processes are never candidates.
+fn sweep_orphaned_bridge() {
+    if full_app_running() {
+        return;
+    }
+    let holders = bridge_holder_pids();
+    let chromes = session_chrome_pids();
+    if holders.is_empty() && chromes.is_empty() {
+        return;
+    }
+    eprintln!(
+        "quick: sweeping orphaned bridge processes (bridge={holders:?}, session_chrome={})",
+        chromes.len()
+    );
+    terminate_pids(&holders);
+    terminate_pids(&chromes);
+}
+
+fn probe_http_client() -> Result<BlockingClient, String> {
+    get_or_build_blocking_client(
+        &PROBE_HTTP_CLIENT,
+        Duration::from_secs(PROBE_TIMEOUT_SECS),
+    )
+}
+
+enum BridgeProbe {
+    Healthy(Value),
+    /// The port accepted our connection but no usable answer came back in
+    /// time: the holder's event loop is starved (the 100%-CPU wedge).
+    Wedged,
+    /// Nothing listening at all.
+    Absent,
+}
+
+/// Bounded-latency liveness probe. Any parseable JSON counts as alive, even a
+/// booting 503: this measures the event loop, not WhatsApp readiness.
+/// Deliberately strict=false so the watchdog never triggers bridge-side
+/// reconnect storms.
+fn probe_bridge() -> BridgeProbe {
+    let Ok(client) = probe_http_client() else {
+        return BridgeProbe::Absent;
+    };
+    match client
+        .get(format!("{}/health?strict=false", bridge_base_url()))
         .send()
-        .ok()?;
-    response.json::<Value>().ok()
+    {
+        Ok(response) => match response.json::<Value>() {
+            Ok(payload) => BridgeProbe::Healthy(payload),
+            Err(_) => BridgeProbe::Wedged,
+        },
+        Err(err) if err.is_connect() => BridgeProbe::Absent,
+        Err(_) => BridgeProbe::Wedged,
+    }
+}
+
+fn wait_for_bridge_healthy(timeout: Duration) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let BridgeProbe::Healthy(payload) = probe_bridge() {
+            return Some(payload);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    None
+}
+
+fn bridge_spawned_recently(state: &AppState) -> bool {
+    state
+        .bridge_spawned_at
+        .lock()
+        .map(|at| {
+            at.map(|t| t.elapsed() < Duration::from_secs(SPAWN_GRACE_SECS))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+fn starting_bridge_payload() -> Value {
+    json!({
+        "success": true,
+        "ready": false,
+        "status": "starting_bridge"
+    })
+}
+
+/// Replace an unresponsive bridge nobody owns. Only ever runs while the full
+/// app is down, so the holder can only be an orphan; a live full app's
+/// bridge is never a candidate.
+fn reclaim_stale_bridge(state: &AppState, app: &AppHandle) -> Result<Value, String> {
+    if full_app_running() {
+        eprintln!("quick: bridge unresponsive but the full app is running; leaving its bridge alone");
+        return Ok(json!({
+            "success": true,
+            "ready": false,
+            "status": "bridge_unresponsive_owner_active"
+        }));
+    }
+    if bridge_spawned_recently(state) {
+        return Ok(starting_bridge_payload());
+    }
+    let holders = bridge_holder_pids();
+    let chromes = session_chrome_pids();
+    eprintln!(
+        "quick: reclaiming unresponsive bridge (bridge_pids={holders:?}, session_chrome={})",
+        chromes.len()
+    );
+    // KILL first: a starved event loop can't run its graceful-shutdown
+    // handler, so anything graceful (POST /shutdown, wait()) would stall.
+    // stop_bridge_process afterwards just reaps our Child handle.
+    terminate_pids(&holders);
+    stop_bridge_process(state);
+    terminate_pids(&chromes);
+    spawn_bridge_if_needed(state, app)?;
+    if let Some(payload) = wait_for_bridge_healthy(Duration::from_secs(20)) {
+        return Ok(payload);
+    }
+    Ok(starting_bridge_payload())
+}
+
+/// Single entry point for every "make sure there is a usable bridge" path
+/// (frontend boot, background watchdog, sleep-wake). Responding bridges are
+/// attached to and never disturbed; only a bridge this process owns may be
+/// restarted on a bad status; an unresponsive bridge with no live owner is
+/// reclaimed automatically — no user action needed.
+fn heal_bridge(state: &AppState, app: &AppHandle) -> Result<Value, String> {
+    let _heal = match state.heal_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => return Ok(starting_bridge_payload()),
+    };
+    match probe_bridge() {
+        BridgeProbe::Healthy(payload) => {
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            eprintln!(
+                "quick: attached to existing bridge (status={status}, owner={})",
+                if owns_bridge(state) { "self" } else { "other-app" }
+            );
+            // Only a bridge this process owns may be torn down and replaced.
+            if !should_restart_bridge(&payload) || !owns_bridge(state) {
+                return Ok(payload);
+            }
+            eprintln!("quick: owned bridge reports unhealthy status; restarting it");
+            stop_bridge_process(state);
+            spawn_bridge_if_needed(state, app)?;
+            if let Some(fresh) = wait_for_bridge_healthy(Duration::from_secs(20)) {
+                return Ok(fresh);
+            }
+            Ok(starting_bridge_payload())
+        }
+        BridgeProbe::Wedged => reclaim_stale_bridge(state, app),
+        BridgeProbe::Absent => {
+            eprintln!("quick: no bridge listening; starting one on the shared session");
+            spawn_bridge_if_needed(state, app)?;
+            if let Some(payload) = wait_for_bridge_healthy(Duration::from_secs(20)) {
+                return Ok(payload);
+            }
+            Ok(starting_bridge_payload())
+        }
+    }
 }
 
 #[tauri::command]
 fn ensure_bridge(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<Value, String> {
-    if let Some(payload) = bridge_reachable() {
-        let unhealthy = should_restart_bridge(&payload);
-        eprintln!(
-            "quick: attached to existing bridge (status={}, owner={})",
-            payload.get("status").and_then(Value::as_str).unwrap_or("-"),
-            if owns_bridge(&state) { "self" } else { "other-app" }
-        );
-        // Attach to an existing bridge, ready or not. Only a bridge this
-        // process owns may be torn down and replaced.
-        if !unhealthy || !owns_bridge(&state) {
-            return Ok(payload);
-        }
-        stop_bridge_process(&state);
-    } else {
-        eprintln!("quick: no bridge listening; starting one on the shared session");
-    }
-
-    spawn_bridge_if_needed(&state, &app)?;
-    std::thread::sleep(Duration::from_millis(900));
-
-    if let Ok(payload) = bridge_get_health_check("/health") {
-        return Ok(payload);
-    }
-
-    if let Some(payload) = bridge_reachable() {
-        return Ok(payload);
-    }
-
-    Ok(json!({
-        "success": true,
-        "ready": false,
-        "status": "starting_bridge"
-    }))
+    heal_bridge(&state, &app)
 }
 
 #[tauri::command]
 fn restart_bridge(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<Value, String> {
-    stop_bridge_process(&state);
-    spawn_bridge_if_needed(&state, &app)?;
-    std::thread::sleep(Duration::from_millis(900));
-
-    if let Ok(payload) = bridge_get_health_check("/health") {
-        return Ok(payload);
+    if owns_bridge(&state) || !full_app_running() {
+        stop_bridge_process(&state);
+        sweep_orphaned_bridge();
     }
-
-    Ok(json!({
-        "success": true,
-        "ready": false,
-        "status": "starting_bridge"
-    }))
+    heal_bridge(&state, &app)
 }
 
 #[tauri::command]
@@ -825,6 +1166,137 @@ fn open_url(url: String) -> Result<(), String> {
         .map_err(|err| format!("Could not open URL: {err}"))?;
 
     Ok(())
+}
+
+fn extension_for_mimetype(mimetype: &str, filename: Option<&str>) -> String {
+    if let Some(name) = filename {
+        if let Some(ext) = std::path::Path::new(name).extension().and_then(|e| e.to_str()) {
+            let ext = ext.to_lowercase();
+            if !ext.is_empty()
+                && ext.len() <= 8
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                return ext;
+            }
+        }
+    }
+    let mime = mimetype.split(';').next().unwrap_or("").trim().to_lowercase();
+    match mime.as_str() {
+        "application/pdf" => "pdf",
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        "image/svg+xml" => "svg",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/mp4" | "audio/x-m4a" => "m4a",
+        "audio/aac" => "aac",
+        "audio/wav" => "wav",
+        "text/plain" => "txt",
+        "application/zip" => "zip",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        _ => "bin",
+    }
+    .to_string()
+}
+
+fn sanitize_filename(filename: Option<&str>, ext: &str) -> String {
+    let base = filename
+        .map(|f| {
+            let stem = std::path::Path::new(f)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("media");
+            let cleaned: String = stem
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            if cleaned.trim_matches('_').is_empty() {
+                "media".to_string()
+            } else {
+                cleaned
+            }
+        })
+        .unwrap_or_else(|| "media".to_string());
+    format!("{base}.{ext}")
+}
+
+/// Save base64 media bytes to a temp file and open it with the OS default app
+/// (Preview for images/PDFs, QuickTime for videos, etc). Returns the path that
+/// was opened so the frontend can show it.
+#[tauri::command]
+fn open_media_external(
+    data: String,
+    mimetype: String,
+    filename: Option<String>,
+) -> Result<String, String> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return Err("data is required".to_string());
+    }
+    let bytes = BASE64
+        .decode(trimmed)
+        .map_err(|err| format!("Invalid base64 data: {err}"))?;
+    if bytes.is_empty() {
+        return Err("data decoded to empty".to_string());
+    }
+
+    let ext = extension_for_mimetype(&mimetype, filename.as_deref());
+    let safe_name = sanitize_filename(filename.as_deref(), &ext);
+    // Unique prefix so two opens of the same-named document never collide
+    // (the OS may keep the previous viewer open and re-read the file).
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join("whatsapp-quick");
+    fs::create_dir_all(&dir).map_err(|err| format!("Could not create temp dir: {err}"))?;
+    let path = dir.join(format!("{unique}-{safe_name}"));
+    fs::write(&path, &bytes).map_err(|err| format!("Could not write temp file: {err}"))?;
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = Command::new("open");
+        cmd.arg(&path);
+        cmd
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(&path);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", path.to_string_lossy().as_ref()]);
+        cmd
+    };
+
+    command
+        .spawn()
+        .map_err(|err| format!("Could not open media: {err}"))?;
+
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1340,6 +1812,8 @@ pub fn run() {
         .manage(AppState {
             bridge_process: Mutex::new(None),
             pending_deep_link: Mutex::new(None),
+            bridge_spawned_at: Mutex::new(None),
+            heal_lock: Mutex::new(()),
         })
         .manage(OverlayState {
             shown: Mutex::new(false),
@@ -1372,6 +1846,7 @@ pub fn run() {
             bridge_get_media,
             bridge_get_profile_pic,
             open_url,
+            open_media_external,
             get_pending_deep_link,
             log_debug,
             get_process_stats,
@@ -1385,17 +1860,27 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // The page is served from Tauri's own asset protocol (frontendDist)
-            // rather than a localhost HTTP server. A remote origin
-            // (http://localhost:<port>) is gated by Tauri's ACL, which rejects
-            // the app's own commands with "not allowed by ACL". The asset
-            // protocol origin is local, so the bridge commands work without a
-            // `remote.urls` declaration. Consequence: no microphone access yet,
-            // which is fine while this palette is text-only.
+            // The page is served from a localhost HTTP server (spawned below),
+            // NOT Tauri's `tauri://localhost` asset protocol. The asset protocol
+            // is not a secure context on macOS WKWebView, so microphone access
+            // (`navigator.mediaDevices.getUserMedia`, needed for voice notes) is
+            // unavailable there. The capability declares `remote.urls` for
+            // `http://localhost:*` so this trusted localhost page can still call
+            // the app's own commands.
+            let ui_dir = resolve_ui_dir(&app.handle()).expect("Cannot locate ui/ directory");
+            let port = spawn_asset_server(ui_dir).expect("Cannot start asset server");
+            let local_url = format!("http://localhost:{port}/index.html");
+            println!("[quick] navigating webview to {local_url}");
 
             // Palette chrome: no native shadow, transparent backing, parked
             // off-screen until the global shortcut asks for it.
             if let Some(window) = app.get_webview_window("main") {
+                let url = tauri::Url::parse(&local_url)
+                    .expect("Failed to parse asset server URL");
+                window
+                    .navigate(url)
+                    .expect("Failed to navigate webview to asset server");
+
                 let _ = window.set_always_on_top(true);
                 let _ = window.set_shadow(false);
                 let _ = window.set_background_color(None);
@@ -1409,10 +1894,25 @@ pub fn run() {
                     scratchpad::configure_panel(&window);
                 }
                 let _ = window.hide();
-                println!("[quick] build 2026-09-16-v0.1.20");
+                println!("[quick] build 2026-09-17-v0.1.22");
             }
 
             register_toggle(app.handle());
+
+            // Background watchdog: if the bridge's event loop starves (the
+            // wedge that froze the UI), reclaim it automatically. Cheap: one
+            // local HTTP hit every 30s, and strictly hands-off while the
+            // full app is running.
+            let watch = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS));
+                if matches!(probe_bridge(), BridgeProbe::Wedged) && !full_app_running() {
+                    let state = watch.state::<AppState>();
+                    if let Err(err) = reclaim_stale_bridge(&state, &watch) {
+                        eprintln!("quick: watchdog reclaim failed: {err}");
+                    }
+                }
+            });
 
             // The app is an accessory (no Dock icon), so the menu-bar item is
             // the reliable way to show, hide, or quit it without a keyboard.
@@ -1429,6 +1929,10 @@ pub fn run() {
                     "quit" => {
                         let state = app.state::<AppState>();
                         stop_bridge_process(&state);
+                        // Fate-sharing: leave no orphaned bridge (or profile-
+                        // locked Chrome) behind. Sweep is a no-op while the
+                        // full app runs.
+                        sweep_orphaned_bridge();
                         app.exit(0);
                     }
                     _ => {}
@@ -1489,24 +1993,13 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                     let state = app_handle.state::<AppState>();
                     stop_bridge_process(&state);
+                    sweep_orphaned_bridge();
                 }
                 tauri::RunEvent::Resumed => {
                     println!("[sleep-wake] Received Resumed event from system - ensuring bridge is healthy");
                     let state = app_handle.state::<AppState>();
-                    // Check if bridge needs restart due to stale connection
-                    if let Ok(payload) = bridge_get_health_check("/health") {
-                        if should_restart_bridge(&payload) || 
-                           !payload.get("ready").and_then(Value::as_bool).unwrap_or(false) {
-                            println!("[sleep-wake] Bridge health check failed - restarting...");
-                            stop_bridge_process(&state);
-                            std::thread::sleep(Duration::from_millis(500));
-                            let _ = spawn_bridge_if_needed(&state, &app_handle);
-                        }
-                    } else {
-                        println!("[sleep-wake] Could not reach bridge - restarting...");
-                        stop_bridge_process(&state);
-                        std::thread::sleep(Duration::from_millis(500));
-                        let _ = spawn_bridge_if_needed(&state, &app_handle);
+                    if let Err(err) = heal_bridge(&state, app_handle) {
+                        eprintln!("[sleep-wake] bridge heal failed: {err}");
                     }
                 }
                 _ => {}

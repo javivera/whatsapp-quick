@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-quick",
-  "version": "0.1.20",
+  "version": "0.1.22",
   "private": true,
   "description": "Floating keyboard-first WhatsApp palette (self-contained; shares the WhatsApp session with WhatsApp Keyboard Desktop).",
   "scripts": {

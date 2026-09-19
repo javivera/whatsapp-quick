@@ -3,6 +3,9 @@
   "identifier": "default",
   "description": "Floating WhatsApp palette",
   "windows": ["main"],
+  "remote": {
+    "urls": ["http://localhost:*"]
+  },
   "permissions": [
     "core:default",
     "core:window:allow-hide",
@@ -17,6 +20,33 @@
     "global-shortcut:allow-is-registered",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
-    "global-shortcut:allow-unregister-all"
+    "global-shortcut:allow-unregister-all",
+    "allow-ensure-bridge",
+    "allow-restart-bridge",
+    "allow-bridge-health",
+    "allow-bridge-get-chats",
+    "allow-bridge-get-messages",
+    "allow-bridge-send-message",
+    "allow-bridge-refresh",
+    "allow-bridge-mark-seen",
+    "allow-bridge-delete-chat",
+    "allow-bridge-archive-chat",
+    "allow-bridge-unarchive-chat",
+    "allow-bridge-send-audio",
+    "allow-bridge-send-image",
+    "allow-bridge-send-media",
+    "allow-bridge-edit-message",
+    "allow-bridge-delete-message",
+    "allow-bridge-react-message",
+    "allow-bridge-get-link-preview",
+    "allow-bridge-forward-message",
+    "allow-bridge-get-media",
+    "allow-bridge-get-profile-pic",
+    "allow-open-url",
+    "allow-open-media-external",
+    "allow-get-pending-deep-link",
+    "allow-log-debug",
+    "allow-get-process-stats",
+    "allow-hide-quick-cmd"
   ]
 }

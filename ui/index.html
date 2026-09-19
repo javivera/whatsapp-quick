@@ -21,7 +21,7 @@
           spellcheck="false"
           aria-label="Search chats"
         >
-        <span class="hint"><kbd>⌘L</kbd> search · <kbd>↑↓</kbd> move · <kbd>↵</kbd> open · <kbd>esc</kbd> hide · <span id="build-version">v—</span></span>
+        <span class="hint"><kbd>⌘L</kbd> search · <kbd>⌘M</kbd> record · <kbd>↵</kbd> open · <kbd>esc</kbd> hide · <span id="build-version">v—</span></span>
       </header>
 
       <main class="panes">
@@ -40,6 +40,11 @@
           <form id="composer" class="composer">
             <div id="pending-media" class="pending-media hidden" aria-label="Pasted images"></div>
             <div id="composer-banner" class="composer-banner hidden"></div>
+            <div id="record-banner" class="record-banner hidden" aria-label="Voice recording">
+              <span class="record-dot"></span>
+              <span id="record-timer" class="record-timer">0:00</span>
+              <span class="record-label">Recording — Enter to send · Esc to cancel</span>
+            </div>
             <div class="composer-row">
               <textarea
                 id="input"
@@ -49,6 +54,7 @@
                 spellcheck="false"
                 aria-label="Message"
               ></textarea>
+              <button id="mic" class="mic" type="button" title="Record voice note (⌘M)">🎤</button>
               <button id="send" class="send" type="submit" title="Send (Enter)">↵</button>
             </div>
           </form>

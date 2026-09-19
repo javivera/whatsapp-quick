@@ -63,7 +63,10 @@ child handle, which killed the full app's bridge. Keep the ownership gate.
 | `⇥` | from the chat list, jump to the composer |
 | `↑` `↓` in an empty composer | jump back to the chat list |
 | `↵` in the composer | send (`⇧↵` for a newline) |
-| `esc` | clear search → leave the composer → hide the palette |
+| `⌘M` | start / stop + send a voice note |
+| `↵` on a message | open its link / media in the default app (voice notes play in-app) |
+| `m` on a message | open the message menu (reply / react / copy / delete…) |
+| `esc` | cancel recording → clear search → leave the composer → hide the palette |
 | `⌘⇧M` again / tray item | dismiss |
 | click another app, `⌘⇥` | dismiss (loses focus) |
 
@@ -72,13 +75,12 @@ accessory (`LSUIElement`), so it has no Dock icon.
 
 ## Architecture notes
 
-- **UI origin.** The page is served from Tauri's own asset protocol, *not* from
-  a localhost HTTP server. A remote origin (`http://localhost:<port>`) is gated
-  by Tauri's ACL, which rejects the app's own commands with
-  `Command … not allowed by ACL`. Consequence: no microphone access, so **voice
-  notes are not sendable from this palette yet**. Adding them means either
-  declaring `remote.urls` for a *fixed* asset-server port, or another secure
-  context.
+- **UI origin.** The page is served from a tiny localhost HTTP server spawned by
+  the app (`http://localhost:<port>`), because that is a *secure context* on
+  macOS WKWebView — `navigator.mediaDevices.getUserMedia` (microphone, used for
+  voice notes) is unavailable under Tauri's `tauri://localhost` asset protocol.
+  The localhost origin is trusted via a `remote.urls` capability entry
+  (`http://localhost:*`), so the page can still call the app's own commands.
 - **Window.** A nonactivating `NSPanel` (`canBecomeKeyWindow → true`) ordered
   front without activating the app, so the palette takes keystrokes without
   stealing the focused app's Space or menu bar. Bottom-anchored inside
