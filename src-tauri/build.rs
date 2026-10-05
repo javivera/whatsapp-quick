@@ -33,6 +33,7 @@ fn main() {
     "get_process_stats",
     "hide_quick_cmd",
     "show_quick_cmd",
+    "set_notification_chat",
   ]);
 
   tauri_build::try_build(

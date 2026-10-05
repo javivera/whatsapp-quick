@@ -48,6 +48,7 @@
     "allow-log-debug",
     "allow-get-process-stats",
     "allow-hide-quick-cmd",
-    "allow-show-quick-cmd"
+    "allow-show-quick-cmd",
+    "allow-set-notification-chat"
   ]
 }

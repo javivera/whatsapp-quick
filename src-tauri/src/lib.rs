@@ -1,3 +1,5 @@
+mod notifications;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::{blocking::Client as BlockingClient, Client as AsyncClient};
 use serde_json::{json, Value};
@@ -50,6 +52,18 @@ struct AppState {
     /// Serialises heal/reclaim runs (ensure_bridge, watchdog, sleep-wake)
     /// so two triggers can't stack competing kill+spawn cycles.
     heal_lock: Mutex<()>,
+}
+
+#[derive(Default)]
+struct NotificationState {
+    active_chat: Mutex<Option<String>>,
+}
+
+#[tauri::command]
+fn set_notification_chat(state: State<NotificationState>, chat_id: String) {
+    if notifications::valid_chat_id(&chat_id) {
+        *state.active_chat.lock().unwrap() = Some(chat_id);
+    }
 }
 
 struct OverlayState {
@@ -1563,7 +1577,7 @@ fn show_quick<R: Runtime>(app: &AppHandle<R>) {
 }
 
 fn receive_quick_link<R: Runtime>(app: &AppHandle<R>, url: &tauri::Url) {
-    if url.scheme() != "whatsapp-quick" || url.host_str() != Some("send") || !matches!(url.path(), "" | "/") {
+    if url.scheme() != "whatsapp-quick" || !matches!(url.host_str(), Some("send" | "chat")) || !matches!(url.path(), "" | "/") {
         return;
     }
     let value = url.to_string();
@@ -1867,6 +1881,7 @@ pub fn run() {
             bridge_spawned_at: Mutex::new(None),
             heal_lock: Mutex::new(()),
         })
+        .manage(NotificationState::default())
         .manage(OverlayState {
             shown: Mutex::new(false),
             was_focused: Mutex::new(false),
@@ -1903,7 +1918,8 @@ pub fn run() {
             log_debug,
             get_process_stats,
             hide_quick_cmd,
-            show_quick_cmd
+            show_quick_cmd,
+            set_notification_chat
         ])
         .setup(|app| {
             // THIS is the ytm line we were missing. Without it Tauri keeps a
@@ -1947,10 +1963,12 @@ pub fn run() {
                     scratchpad::configure_panel(&window);
                 }
                 let _ = window.hide();
-                println!("[quick] build 2026-09-17-v0.1.22");
+                println!("[quick] build v{}", app.package_info().version);
             }
 
             register_toggle(app.handle());
+            #[cfg(target_os = "macos")]
+            notifications::start(app.handle());
 
             // Background watchdog: if the bridge's event loop starves (the
             // wedge that froze the UI), reclaim it automatically. Cheap: one
@@ -1974,6 +1992,8 @@ pub fn run() {
             let quit_item =
                 MenuItem::with_id(app, "quit", "Quit WhatsApp Quick", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            #[cfg(target_os = "macos")]
+            notifications::add_menu_items(app.handle(), &menu)?;
             let mut tray = TrayIconBuilder::with_id("quick")
                 .menu(&menu)
                 .tooltip("WhatsApp Quick")
@@ -1988,7 +2008,10 @@ pub fn run() {
                         sweep_orphaned_bridge();
                         app.exit(0);
                     }
-                    _ => {}
+                    _ => {
+                        #[cfg(target_os = "macos")]
+                        notifications::menu_event(app, event.id().as_ref());
+                    }
                 });
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());

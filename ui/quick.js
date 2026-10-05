@@ -152,13 +152,19 @@ async function ensureProfilePic(chatId) {
 function parseQuickLink(raw) {
   try {
     const url = new URL(raw);
-    if (url.protocol !== "whatsapp-quick:" || url.hostname !== "send" ||
+    if (url.protocol !== "whatsapp-quick:" ||
         (url.pathname !== "" && url.pathname !== "/")) return null;
+    if (url.hostname === "chat") {
+      const chatId = url.searchParams.get("id") || "";
+      if (!/^[0-9-]{1,60}@(c\.us|g\.us|lid)$/.test(chatId)) return null;
+      return { chatId, text: "" };
+    }
+    if (url.hostname !== "send") return null;
     const phone = url.searchParams.get("phone");
     if (!phone || !/^[1-9][0-9]{5,14}$/.test(phone)) return null;
     const text = url.searchParams.get("text") || "";
     if (text.length > 10000) return null;
-    return { phone, text };
+    return { phone, chatId: `${phone}@c.us`, text };
   } catch (_) {
     return null;
   }
@@ -180,10 +186,16 @@ async function acceptQuickLink(raw) {
   }
   // Cold-launch show events can precede WebView subscription; this one cannot.
   invoke("show_quick_cmd").catch(() => {});
-  const chatId = `${link.phone}@c.us`;
+  const chatId = link.chatId;
+  if (!link.phone) {
+    state.groupMode = chatId.endsWith("@g.us");
+    updateSidebarModeUI();
+    await refreshChats();
+    if (sequence !== quickLinkSequence) return;
+  }
   const existing = state.chats.find((chat) => chat.id === chatId);
   if (!existing) {
-    state.linkChat = { id: chatId, name: `+${link.phone}`, is_group: false };
+    state.linkChat = { id: chatId, name: link.phone ? `+${link.phone}` : chatId, is_group: chatId.endsWith("@g.us") };
     state.chats.unshift(state.linkChat);
     applyFilter();
   }
@@ -345,6 +357,7 @@ async function openChat(chatId) {
   const openedIdx = state.filtered.findIndex((c) => c.id === chatId);
   if (openedIdx >= 0) state.selected = openedIdx;
   state.activeChatId = chatId;
+  invoke("set_notification_chat", { chatId }).catch(() => {});
   state.selectedMsgId = null;
   // Opening a chat marks it read: clear the badge immediately and tell
   // the bridge to sendSeen (so WhatsApp itself clears the unread count).

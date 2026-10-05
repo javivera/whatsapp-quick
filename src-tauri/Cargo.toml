@@ -1,6 +1,6 @@
 [package]
 name = "whatsapp_quick"
-version = "0.1.23"
+version = "0.1.24"
 description = "Floating keyboard-first WhatsApp palette"
 authors = ["Javi Vera"]
 edition = "2021"
@@ -26,6 +26,7 @@ sysinfo = "0.31"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger", "UNNotificationResponse", "UNNotification", "UNNotificationSound"] }
 objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSPanel", "NSResponder", "NSScreen", "NSEvent", "NSWorkspace", "NSRunningApplication", "NSApplication"] }
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSDictionary", "NSValue", "NSNotification", "NSObject", "NSOperation", "block2"] }
 block2 = "0.6"

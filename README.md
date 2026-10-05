@@ -36,12 +36,32 @@ its WhatsApp identity when you actually send. Unsupported wa.me short codes
 (e.g. `/message/...`) are left alone. No system `whatsapp://` or HTTPS handler
 is replaced.
 
+## Native macOS notifications
+
+Quick requests macOS notification permission on first launch. Choose **Allow**
+to receive banners, sounds and Notification Center entries for new incoming
+messages, even when the palette is hidden. Click a banner to open that chat
+(including groups). The menu-bar menu includes **Test macOS Notification** and
+**Notification Settings…**; macOS controls banners, previews, sounds and Focus.
+
+Notifications skip your own messages, muted/archived chats, status broadcasts,
+system messages, duplicates, and the conversation currently visible in Quick.
+Media gets a readable label instead of encoded data. They are live-only: existing
+unread messages and messages older than two minutes do not alert on startup or
+wake. Quick must remain running; quitting stops notification delivery.
+
+The bundled bridge provides a bounded `/notification-events` feed, polled by
+Rust rather than WebView timers. Attaching to an older bridge without this
+endpoint leaves chat functionality intact but disables notifications (logged),
+without restarting or modifying another app's bridge. Close the owning app and
+restart Quick to use its updated bundled bridge.
+
 ## Sharing the bridge (the important part)
 
 The bridge is `bridge_server.js` in this folder, bundled into this app
 unchanged. Both apps run the *same* bridge code, so there is only one bridge
-to maintain (the source of truth lives in `whatsapp_web_listener/bridge_server.js`;
-copy it here if it changes).
+to maintain (the upstream source lives in `whatsapp_web_listener/bridge_server.js`;
+when updating this copy, preserve Quick's `/notification-events` feed).
 
 Two mechanisms make the two apps cooperate:
 

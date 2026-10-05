@@ -153,6 +153,8 @@ let readyForcedByWatchdog = false;
 
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: AUTH_CLIENT_ID, dataPath: AUTH_DATA_DIR }),
+  // Runtime writes inside a signed .app invalidate its seal (and can break notifications).
+  webVersionCache: { type: "local", path: path.join(AUTH_DATA_DIR, "web-version-cache") },
   puppeteer: {
     headless: HEADLESS,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -1990,6 +1992,87 @@ function updateChatOnMessage(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Live notification feed (memory-only; never populated from history/cache)
+// ---------------------------------------------------------------------------
+
+const NOTIFICATION_EPOCH = require("node:crypto").randomUUID();
+const NOTIFICATION_EVENTS = [];
+const NOTIFICATION_SEEN_IDS = new Set();
+const NOTIFICATION_LIMIT = 500;
+let notificationSequence = 0;
+
+function notificationPreview(msg) {
+  const type = String(msg?.type || "chat").toLowerCase();
+  // Media bodies can contain encoded bytes; never expose them in a banner.
+  const media = { ptt: "Voice message", audio: "Audio", image: "Photo",
+    video: "Video", document: "Document", sticker: "Sticker", location: "Location",
+    vcard: "Contact", multi_vcard: "Contacts", poll_creation: "Poll" };
+  return media[type] || String(msg?.body || "New message").replace(/\s+/g, " ").trim().slice(0, 240);
+}
+
+async function getNotificationChat(msg, chatId) {
+  try {
+    return await msg.getChat();
+  } catch (_) {
+    // This WA Web build's getChat path throws `r`; use the same raw Store
+    // seam as message history, without fetching messages or changing read state.
+    return client.pupPage.evaluate((id) => {
+      const collection = window.Store?.Chat ||
+        (typeof window.require === "function" ? window.require("WAWebCollections")?.Chat : null);
+      const factory = window.Store?.WidFactory ||
+        (typeof window.require === "function" ? window.require("WAWebWidFactory") : null);
+      const chat = collection?.get?.(factory?.createWid(id)) || collection?.get?.(id);
+      const expiration = chat?.mute?.expiration;
+      if (!chat || typeof expiration !== "number") return null;
+      return { name: chat.formattedTitle || "", archived: Boolean(chat.archive),
+        isMuted: expiration === -1 || expiration > Date.now() / 1000 };
+    }, chatId);
+  }
+}
+
+async function queueIncomingNotification(msg) {
+  const id = chatUpdateId(msg);
+  const chatId = String(msg?.id?.remote || msg?.from || "");
+  const timestamp = Number(msg?.timestamp || 0);
+  const age = Date.now() / 1000 - timestamp;
+  if (!state.ready || msg?.fromMe || !id || !chatId || msg?.isStatus
+      || chatId.endsWith("@broadcast") || isHiddenSystemNotification(msg)
+      || ["revoked", "call_log", "protocol"].includes(String(msg?.type || ""))
+      || !Number.isFinite(age) || age < -30 || age > 120
+      || NOTIFICATION_SEEN_IDS.has(id)) return;
+  NOTIFICATION_SEEN_IDS.add(id);
+  if (NOTIFICATION_SEEN_IDS.size > NOTIFICATION_LIMIT * 4) {
+    NOTIFICATION_SEEN_IDS.delete(NOTIFICATION_SEEN_IDS.values().next().value);
+  }
+  try {
+    // Resolve current mute state rather than trusting a possibly stale disk cache.
+    const chat = await withTimeout(() => getNotificationChat(msg, chatId), PUPPETEER_OP_TIMEOUT_MS, "notification chat");
+    if (!chat || typeof chat.isMuted !== "boolean" || chat.isMuted || chat.archived) return;
+    const isGroup = chatId.endsWith("@g.us");
+    NOTIFICATION_EVENTS.push({
+      sequence: ++notificationSequence, id, chat_id: chatId, timestamp,
+      title: String(chat.name || msg.notifyName || chatId).slice(0, 100),
+      subtitle: isGroup ? String(msg.notifyName || state.authorNames.get(String(msg.author || "")) || "").slice(0, 100) : "",
+      body: notificationPreview(msg),
+    });
+    if (NOTIFICATION_EVENTS.length > NOTIFICATION_LIMIT) NOTIFICATION_EVENTS.shift();
+  } catch (err) {
+    // Fail closed: a failed mute lookup must not produce an unwanted alert.
+    console.warn("[bridge] notification chat lookup failed:", err?.message || err);
+  }
+}
+
+function handleNotificationEvents(urlObj, res) {
+  const epoch = urlObj.searchParams.get("epoch");
+  const after = Number(urlObj.searchParams.get("after"));
+  // First connection (or a restarted bridge) establishes a baseline, not a replay.
+  const events = epoch === NOTIFICATION_EPOCH && Number.isSafeInteger(after) && after >= 0
+    ? NOTIFICATION_EVENTS.filter((event) => event.sequence > after)
+    : [];
+  json(res, 200, { success: true, epoch: NOTIFICATION_EPOCH, cursor: notificationSequence, events });
+}
+
+// ---------------------------------------------------------------------------
 // Background refresh
 // ---------------------------------------------------------------------------
 
@@ -3271,6 +3354,8 @@ const server = http.createServer(async (req, res) => {
 
     if (method === "GET" && urlObj.pathname === "/health") {
       await handleHealth(urlObj, res);
+    } else if (method === "GET" && urlObj.pathname === "/notification-events") {
+      handleNotificationEvents(urlObj, res);
     } else if (method === "GET" && urlObj.pathname === "/chats") {
       await handleChats(urlObj, res);
     } else if (method === "GET" && urlObj.pathname === "/messages") {
@@ -3701,6 +3786,7 @@ client.on("message", (msg) => {
   touchStatus("message_received");
   appendMessageToCache(msg);
   updateChatOnMessage(msg);
+  queueIncomingNotification(msg);
 });
 
 client.on("message_create", (msg) => {
