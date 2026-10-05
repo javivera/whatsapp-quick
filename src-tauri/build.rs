@@ -32,6 +32,7 @@ fn main() {
     "log_debug",
     "get_process_stats",
     "hide_quick_cmd",
+    "show_quick_cmd",
   ]);
 
   tauri_build::try_build(

@@ -47,6 +47,7 @@
     "allow-get-pending-deep-link",
     "allow-log-debug",
     "allow-get-process-stats",
-    "allow-hide-quick-cmd"
+    "allow-hide-quick-cmd",
+    "allow-show-quick-cmd"
   ]
 }

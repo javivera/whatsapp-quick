@@ -28,6 +28,7 @@ const AUTH_DATA_DIR = (
   path.resolve(process.cwd(), ".wwebjs_auth")
 ).trim();
 const CHAT_CACHE_PATH = path.join(AUTH_DATA_DIR, `chat-cache-${AUTH_CLIENT_ID}.json`);
+const DELETED_MESSAGES_PATH = path.join(AUTH_DATA_DIR, `deleted-messages-${AUTH_CLIENT_ID}.json`);
 const PUPPETEER_EXECUTABLE_PATH = (
   process.env.PUPPETEER_EXECUTABLE_PATH ||
   [
@@ -49,6 +50,10 @@ const BG_MAX_BACKOFF_MS = 5 * 60_000;
 const PUPPETEER_OP_TIMEOUT_MS = 15_000;
 // How many recent messages to keep per chat in memory.
 const MESSAGES_CACHE_LIMIT = 1000;
+// Live events normally keep message caches current. Revalidate an active
+// thread periodically so a dropped WhatsApp Web event cannot leave it stale
+// until the bridge is restarted.
+const MESSAGE_CACHE_REVALIDATE_MS = 8_000;
 // How many recent chats to warm on startup.
 const STARTUP_PREWARM_CHAT_COUNT = Number.parseInt(
   process.env.WEBJS_STARTUP_PREWARM_CHAT_COUNT || "6",
@@ -69,11 +74,14 @@ const state = {
   // Chat list cache (array of normalized chat objects)
   chatsCache: [],
   chatsCacheAt: 0,
+  // Group sender names resolved in one browser call per history fetch.
+  authorNames: new Map(),
 
   // Per-chat message cache: Map<chatId, { messages: NormalizedMsg[], fetchedAt: number, chatMeta: {...} }>
   messagesCache: new Map(),
   messageFetchQueueTail: Promise.resolve(),
   messageFetchInFlight: new Map(),
+  deletedPlaceholders: new Map(),
 
   // Profile picture cache:
   // Map<chatId, { url: string|null, dataUrl: string|null, fetchedAt: number }>
@@ -91,6 +99,48 @@ const state = {
   latestQrText: "",
   latestQrSvg: "",
 };
+
+function loadDeletedPlaceholders() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(DELETED_MESSAGES_PATH, "utf8"));
+    if (!Array.isArray(saved)) return;
+    for (const entry of saved) {
+      if (typeof entry?.chat_id !== "string" || typeof entry.id !== "string" ||
+          entry.chat_id.length > 256 || entry.id.length > 256 ||
+          !Number.isFinite(entry.timestamp)) continue;
+      const items = state.deletedPlaceholders.get(entry.chat_id) || [];
+      items.push({ id: entry.id, type: "deleted", timestamp: entry.timestamp,
+        from_me: Boolean(entry.from_me), body: "" });
+      state.deletedPlaceholders.set(entry.chat_id, items.slice(-200));
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") console.warn("[bridge] Could not load deleted messages:", err.message);
+  }
+}
+
+function saveDeletedPlaceholders() {
+  const entries = [];
+  for (const [chatId, items] of state.deletedPlaceholders) {
+    for (const msg of items) {
+      entries.push({ chat_id: chatId, id: msg.id, timestamp: msg.timestamp, from_me: msg.from_me });
+    }
+  }
+  const temp = `${DELETED_MESSAGES_PATH}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(entries), { mode: 0o600 });
+  fs.renameSync(temp, DELETED_MESSAGES_PATH);
+}
+
+function mergeDeletedPlaceholders(chatId, messages) {
+  const placeholders = state.deletedPlaceholders.get(chatId) || [];
+  if (!placeholders.length) return messages;
+  const deletedIds = new Set(placeholders.map((msg) => msg.id));
+  return messages.filter((msg) => !deletedIds.has(msg.id))
+    .concat(placeholders)
+    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0))
+    .slice(-MESSAGES_CACHE_LIMIT);
+}
+
+loadDeletedPlaceholders();
 
 let shutdownPromise = null;
 let authenticatedReadyWatchdogTimer = null;
@@ -420,14 +470,54 @@ function transcodeToMp3(audioData) {
   ]);
 }
 
+// WhatsApp Web's media model now has its own enumerable __x_id. In
+// whatsapp-web.js 1.34.7, sendMessage spreads that model into the outgoing
+// message *after* setting its real MsgKey. The media __x_id overwrites the
+// message's backing id, so WhatsApp's send action throws in getSender() while
+// constructing the message. The media is already uploaded at this point;
+// removing only the colliding field from the returned media model preserves
+// the actual MsgKey. Install on the current page before every media send,
+// since WhatsApp Web can reload and lose the patch.
+async function ensureMediaMessageIdCompat() {
+  await withTimeout(
+    () => client.pupPage.evaluate(() => {
+      // The current MsgKey exposes $1/toString(), but whatsapp-web.js looks
+      // up _serialized after sending to return the created message. Without
+      // this alias it reports success with no message ID or cache entry.
+      const MsgKey = window.require("WAWebMsgKey");
+      if (!("_serialized" in MsgKey.prototype)) {
+        Object.defineProperty(MsgKey.prototype, "_serialized", {
+          configurable: true,
+          get() { return this.$1 || this.toString(); },
+        });
+      }
+      if (window.WWebJS.__quickMediaMessageIdCompat) return;
+      const original = window.WWebJS.processMediaData;
+      window.WWebJS.processMediaData = async (...args) => {
+        const media = await original(...args);
+        if (Object.prototype.hasOwnProperty.call(media, "__x_id")) {
+          delete media.__x_id;
+        }
+        return media;
+      };
+      window.WWebJS.__quickMediaMessageIdCompat = true;
+    }),
+    PUPPETEER_OP_TIMEOUT_MS,
+    "install media message ID compatibility",
+  );
+}
+
 async function sendAudioClip(chatId, audioData, mimetype) {
   const media = new MessageMedia(mimetype, audioData, audioFilenameForMimetype(mimetype));
   return await withRetry(
-    () => withTimeout(
-      () => client.sendMessage(chatId, media, { waitUntilMsgSent: true }),
-      PUPPETEER_OP_TIMEOUT_MS * 3,
-      `sendAudio(${chatId})`,
-    ),
+    async () => {
+      await ensureMediaMessageIdCompat();
+      return withTimeout(
+        () => client.sendMessage(chatId, media, { waitUntilMsgSent: true }),
+        PUPPETEER_OP_TIMEOUT_MS * 3,
+        `sendAudio(${chatId})`,
+      );
+    },
     `sendAudio(${chatId})`,
   );
 }
@@ -450,11 +540,14 @@ async function sendMediaAttachment(chatId, mediaData, mimetype, filename, captio
   }
 
   return await withRetry(
-    () => withTimeout(
-      () => client.sendMessage(chatId, media, options),
-      PUPPETEER_OP_TIMEOUT_MS * 3,
-      `sendMedia(${chatId})`,
-    ),
+    async () => {
+      await ensureMediaMessageIdCompat();
+      return withTimeout(
+        () => client.sendMessage(chatId, media, options),
+        PUPPETEER_OP_TIMEOUT_MS * 3,
+        `sendMedia(${chatId})`,
+      );
+    },
     `sendMedia(${chatId})`,
   );
 }
@@ -583,44 +676,40 @@ function mergeChatSnapshots(previousChats, nextChats, { preserveMissing = false 
   return merged;
 }
 
-async function resolveMissingChatNames(chats) {
-  const ids = chats
-    .filter((chat) => !chat.is_group && chat.id.endsWith("@lid") && isFallbackChatName(chat.name, chat.id))
-    .map((chat) => chat.id);
-  if (!ids.length) return;
+async function resolveContactNames(ids) {
+  if (!ids.length) return {};
 
   try {
-    const resolved = await withTimeout(
+    return await withTimeout(
       () => client.pupPage.evaluate(async (chatIds) => {
         const result = {};
-        const methods = window.Store.ContactMethods;
+        // The injected whatsapp-web.js API exposes these modules through
+        // window.require; Store.ContactMethods/Store.Contact are not always set.
+        const collections = window.require("WAWebCollections");
+        const methods = window.require("WAWebContactGetters");
+        const widFactory = window.require("WAWebWidFactory");
+        const contacts = collections.Contact;
+        const apiContact = window.require("WAWebApiContact");
 
         for (const chatId of chatIds) {
           try {
-            const wid = window.Store.WidFactory.createWid(chatId);
-            const phoneWid = window.Store.LidUtils?.getPhoneNumber?.(wid) || null;
-            const candidates = [];
-
-            for (const candidateWid of [wid, phoneWid]) {
+            const wid = widFactory.createWid(chatId);
+            const alternate = apiContact.getAlternateUserWid(wid);
+            for (const candidateWid of [wid, alternate]) {
               if (!candidateWid) continue;
-              let contact = window.Store.Contact.get?.(candidateWid) || null;
-              if (!contact && typeof window.Store.Contact.find === "function") {
-                try { contact = await window.Store.Contact.find(candidateWid); } catch (_) {}
+              let contact = contacts.get(candidateWid);
+              if (!contact) {
+                try { contact = await contacts.find(candidateWid); } catch (_) {}
               }
-              if (contact) candidates.push(contact);
-            }
-
-            for (const contact of candidates) {
-              const values = [
-                methods?.getName?.(contact),
-                methods?.getShortName?.(contact),
-                methods?.getPushname?.(contact),
-                methods?.getVerifiedName?.(contact),
+              if (!contact) continue;
+              const name = [
+                methods.getName(contact),
+                methods.getShortName(contact),
+                methods.getPushname(contact),
+                methods.getVerifiedName(contact),
                 contact.name,
                 contact.pushname,
-                contact.shortName,
-              ];
-              const name = values.find((value) => typeof value === "string" && value.trim());
+              ].find((value) => typeof value === "string" && value.trim());
               if (name) {
                 result[chatId] = name.trim();
                 break;
@@ -632,14 +721,21 @@ async function resolveMissingChatNames(chats) {
         return result;
       }, ids),
       PUPPETEER_OP_TIMEOUT_MS,
-      "resolve LID contact names",
+      "resolve contact names",
     );
-
-    for (const chat of chats) {
-      if (resolved?.[chat.id]) chat.name = resolved[chat.id];
-    }
   } catch (err) {
-    console.warn("[bridge] LID contact-name resolution failed:", err?.message || err);
+    console.warn("[bridge] Contact-name resolution failed:", err?.message || err);
+    return {};
+  }
+}
+
+async function resolveMissingChatNames(chats) {
+  const ids = chats
+    .filter((chat) => !chat.is_group && chat.id.endsWith("@lid") && isFallbackChatName(chat.name, chat.id))
+    .map((chat) => chat.id);
+  const resolved = await resolveContactNames(ids);
+  for (const chat of chats) {
+    if (resolved[chat.id]) chat.name = resolved[chat.id];
   }
 }
 
@@ -884,11 +980,14 @@ async function normalizeMessage(msg, { forceLoadReactions = false } = {}) {
   return {
     id: serializeMessageId(msg?.id),
     from_me: Boolean(msg?.fromMe),
+    author: String(msg?.author?._serialized || msg?.author || msg?._data?.author?._serialized || ""),
+    author_name: state.authorNames.get(String(msg?.author?._serialized || msg?.author || msg?._data?.author?._serialized || "")) || String(msg?.notifyName || msg?._data?.notifyName || "").trim(),
     timestamp: Number(msg?.timestamp || 0),
     type: String(msg?.type || "text"),
     body: String(msg?.body || "").trim(),
     duration_seconds: parseNumericValue(msg?.duration),
     has_media: Boolean(msg?.hasMedia),
+    thumbnail: jpegThumbnailDataUrl(msg),
     title: String(msg?.title || "").trim(),
     description: String(msg?.description || "").trim(),
     links,
@@ -896,6 +995,25 @@ async function normalizeMessage(msg, { forceLoadReactions = false } = {}) {
     quoted_msg,
     reactions,
   };
+}
+
+function jpegThumbnailDataUrl(msg) {
+  const raw = msg?._data?.jpegThumbnail || msg?.jpegThumbnail;
+  if (!raw) return "";
+  if (typeof raw === "string") {
+    const value = raw.trim();
+    if (!value) return "";
+    if (value.startsWith("data:image/")) return value;
+    if (value.length < 64) return "";
+    return `data:image/jpeg;base64,${value}`;
+  }
+  try {
+    const buf = Buffer.from(raw.data || raw);
+    if (buf.length < 32) return "";
+    return `data:image/jpeg;base64,${buf.toString("base64")}`;
+  } catch (_) {
+    return "";
+  }
 }
 
 function serializeMessageId(messageId) {
@@ -1113,11 +1231,14 @@ async function generateVideoPosterDataUrl(mediaData, mimetype) {
   const inputBuffer = Buffer.from(mediaData, "base64");
 
   return new Promise((resolve, reject) => {
+    // MP4 needs a seekable input. `-ss` *before* `-i pipe:0` fails with
+    // "partial file" / empty stdout, which left video bubbles blank.
+    // Decode from stdin, then take a frame a fraction of a second in.
     const child = spawn(ffmpegBin, [
       "-hide_banner",
       "-loglevel", "error",
-      "-ss", "0.15",
       "-i", "pipe:0",
+      "-ss", "0.15",
       "-frames:v", "1",
       "-an",
       "-f", "image2pipe",
@@ -1398,19 +1519,25 @@ async function fetchProfilePicDataUrl(url, chatId) {
 
 async function fetchProfilePicThumbDataUrl(chatId) {
   try {
-    const base64 = await withTimeout(
+    const picSource = await withTimeout(
       () => client.pupPage.evaluate(async (targetChatId) => {
         const widFactory = window.Store?.WidFactory ||
           (typeof window.require === "function" ? window.require("WAWebWidFactory") : null);
         const chatWid = widFactory.createWid(targetChatId);
-        const base64Data = await window.WWebJS.getProfilePicThumbToBase64(chatWid);
-        return base64Data || null;
+        const pic = await window.require("WAWebCollections").ProfilePicThumb.find(chatWid);
+        // Current WhatsApp Web models expose previewEurl/eurl, not img.
+        // whatsapp-web.js's thumbnail helper still reads img and returns null.
+        const url = pic?.previewEurl || pic?.eurl;
+        if (url) return { url };
+        const base64 = await window.WWebJS.getProfilePicThumbToBase64(chatWid);
+        return { base64: base64 || null };
       }, chatId),
       PUPPETEER_OP_TIMEOUT_MS,
       `getProfilePicThumbToBase64(${chatId})`,
     );
 
-    return base64 ? `data:image/jpeg;base64,${base64}` : null;
+    if (picSource?.url) return await fetchProfilePicDataUrl(picSource.url, chatId);
+    return picSource?.base64 ? `data:image/jpeg;base64,${picSource.base64}` : null;
   } catch (err) {
     if (!isTransientClientError(err)) {
       console.warn(`[bridge] profile thumb fetch failed for ${chatId}:`, err?.message || err);
@@ -1585,6 +1712,22 @@ async function fetchMessagesCompat(chat, chatId, limit) {
   });
 }
 
+function mergeMessagesArrivingDuringFetch(messages, currentMessages, messageIdsAtStart) {
+  const fetchedIds = new Set(messages.map((message) => message.id).filter(Boolean));
+  for (const message of currentMessages || []) {
+    if (
+      message.id &&
+      !messageIdsAtStart.has(message.id) &&
+      !fetchedIds.has(message.id)
+    ) {
+      messages.push(message);
+      fetchedIds.add(message.id);
+    }
+  }
+  messages.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+  return messages.slice(-MESSAGES_CACHE_LIMIT);
+}
+
 /**
  * Fetch message history for a chat from Puppeteer and store in cache.
  * Returns the cached entry (messages + meta). This is called:
@@ -1595,6 +1738,14 @@ async function fetchMessagesCompat(chat, chatId, limit) {
  */
 async function fetchMessagesFromPuppeteer(chatId, limit = MESSAGES_CACHE_LIMIT) {
   const label = `fetchMessages(${chatId})`;
+  // Remember the IDs that existed before the Store snapshot. Live message
+  // events can append to this cache while Puppeteer is fetching; those new
+  // arrivals must be merged back rather than discarded when the snapshot
+  // replaces the cache entry below.
+  const cacheAtStart = state.messagesCache.get(chatId);
+  const messageIdsAtStart = new Set(
+    (cacheAtStart?.messages || []).map((message) => message.id).filter(Boolean),
+  );
   try {
     let chat = null;
     try {
@@ -1617,9 +1768,31 @@ async function fetchMessagesFromPuppeteer(chatId, limit = MESSAGES_CACHE_LIMIT) 
 
     rawMessages.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
 
+    if (chatId.endsWith("@g.us")) {
+      const authors = [...new Set(rawMessages
+        .filter((msg) => !msg.fromMe)
+        .map((msg) => String(msg.author?._serialized || msg.author || msg._data?.author?._serialized || ""))
+        .filter(Boolean))];
+      for (const contact of state.chatsCache) {
+        if (authors.includes(contact.id) && !isFallbackChatName(contact.name, contact.id)) {
+          state.authorNames.set(contact.id, contact.name);
+        }
+      }
+      const missing = authors.filter((id) => !state.authorNames.has(id));
+      const resolved = await resolveContactNames(missing);
+      for (const [id, name] of Object.entries(resolved)) state.authorNames.set(id, name);
+    }
+
     const cachedChat = state.chatsCache.find((entry) => entry.id === chatId);
+    const messages = await Promise.all(rawMessages.map(normalizeMessage));
+    const currentEntry = state.messagesCache.get(chatId);
+
     const entry = {
-      messages: await Promise.all(rawMessages.map(normalizeMessage)),
+      messages: mergeDeletedPlaceholders(chatId, mergeMessagesArrivingDuringFetch(
+        messages,
+        currentEntry?.messages,
+        messageIdsAtStart,
+      )),
       fetchedAt: Date.now(),
       reachedStart: rawMessages.length < limit,
       chatMeta: {
@@ -1723,17 +1896,30 @@ async function appendMessageToCache(msg) {
 
   const normalized = await normalizeMessage(msg);
 
-  // Deduplicate by message ID
-  if (normalized.id && entry.messages.some((m) => m.id === normalized.id)) {
-    return;
+  // A background Store fetch may have replaced the cache entry while the
+  // message was being normalized. Re-read it so this live arrival is never
+  // appended to a detached object and silently lost.
+  entry = state.messagesCache.get(cacheKey);
+  if (!entry) {
+    entry = { messages: [], fetchedAt: 0, chatMeta: { id: cacheKey, name: "", is_group: false } };
+    state.messagesCache.set(cacheKey, entry);
   }
 
+  // Deduplicate by message ID. Return the cached value so send handlers can
+  // wait for the cache write and render the exact message immediately.
+  const cached = normalized.id
+    ? entry.messages.find((m) => m.id === normalized.id)
+    : null;
+  if (cached) return cached;
+
   entry.messages.push(normalized);
+  entry.fetchedAt = Date.now();
 
   // Trim to limit
   if (entry.messages.length > MESSAGES_CACHE_LIMIT) {
     entry.messages = entry.messages.slice(-MESSAGES_CACHE_LIMIT);
   }
+  return normalized;
 }
 
 /**
@@ -1932,23 +2118,29 @@ async function handleMessages(urlObj, res) {
   const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(1000, limitRaw)) : 80;
 
   let entry = state.messagesCache.get(chatId);
+  const visibleMessages = mergeDeletedPlaceholders(chatId, entry?.messages || []);
 
-  // For cold chats or when more history is requested than currently cached,
-  // queue a background Puppeteer fetch for the requested limit.
-  const needsFetch = !entry || !entry.fetchedAt || (limit > entry.messages.length && !entry.reachedStart);
+  // Live message events are the fast path. The age check is a safety net for
+  // events dropped by WhatsApp Web: without it, a populated cache is never
+  // fetched again and the thread stays stale until the bridge restarts.
+  const cacheAgeMs = entry?.fetchedAt ? Date.now() - entry.fetchedAt : Infinity;
+  const needsFetch = !entry || !entry.fetchedAt ||
+    cacheAgeMs >= MESSAGE_CACHE_REVALIDATE_MS ||
+    (limit > entry.messages.length && !entry.reachedStart);
 
   if (needsFetch) {
     queueMessagesFetch(chatId, limit, true).catch((err) => {
       console.warn(`[bridge] background message fetch failed for ${chatId}:`, err?.message || err);
     });
 
-    const hasMessages = entry?.messages?.length > 0;
     json(res, 200, {
       success: true,
       chat: entry?.chatMeta || { id: chatId, name: chatId, is_group: false },
-      messages: entry?.messages?.slice(-limit) || [],
+      messages: visibleMessages.slice(-limit),
       from_cache: Boolean(entry?.fetchedAt),
-      loading: !hasMessages,
+      // A populated cache can still be stale while it is being revalidated.
+      // Tell the UI to retry so it picks up the completed snapshot promptly.
+      loading: true,
       reached_start: Boolean(entry?.reachedStart),
       cache_age_ms: entry?.fetchedAt ? Date.now() - entry.fetchedAt : -1,
     });
@@ -1966,7 +2158,7 @@ async function handleMessages(urlObj, res) {
     return;
   }
 
-  const messages = entry.messages.slice(-limit);
+  const messages = visibleMessages.slice(-limit);
   json(res, 200, {
     success: true,
     chat: entry.chatMeta || { id: chatId, name: chatId, is_group: false },
@@ -2032,13 +2224,15 @@ async function handleSend(req, res) {
       `sendMessage(${resolvedChatId})`,
     );
 
-    // Immediately append to cache so the UI sees it
-    appendMessageToCache(message);
+    // Finish the cache write before replying. The frontend refreshes the
+    // thread as soon as this request resolves, so fire-and-forget here races
+    // that refresh and makes a sent message appear only on a later poll.
+    const normalizedMessage = await appendMessageToCache(message);
     updateChatOnMessage(message);
 
     json(res, 200, {
       success: true,
-      message: await normalizeMessage(message),
+      message: normalizedMessage,
     });
   } catch (err) {
     console.error(`[bridge] sendMessage failed:`, err?.message || err);
@@ -2110,6 +2304,27 @@ async function handleEditMessage(req, res) {
   }
 }
 
+async function deleteMessageForMeCompat(chatId, messageId) {
+  return client.pupPage.evaluate(async (chatId, messageId) => {
+    const collections = window.require("WAWebCollections");
+    const wid = window.require("WAWebWidFactory").createWid(chatId);
+    const chat = collections.Chat.get(wid) || collections.Chat.get(chatId);
+    if (!chat) throw new Error("Chat is not loaded in WhatsApp Web");
+    const msg = chat.msgs.getModelsArray().find((entry) =>
+      (entry.id?._serialized || entry.id?.$1 || entry.id?.toString?.()) === messageId,
+    );
+    if (!msg) {
+      throw new Error("Message is not loaded in this chat; reopen the chat and retry");
+    }
+    const { Cmd } = window.require("WAWebCmd");
+    if (window.WWebJS.compareWwebVersions(window.Debug.VERSION, ">=", "2.3000.0")) {
+      await Cmd.sendDeleteMsgs(chat, { list: [msg], type: "message" }, true);
+    } else {
+      await Cmd.sendDeleteMsgs(chat, [msg], true);
+    }
+  }, chatId, messageId);
+}
+
 async function handleDeleteMessage(req, res) {
   if (!state.ready) {
     json(res, 503, { success: false, error: "WhatsApp client is not ready yet" });
@@ -2130,24 +2345,52 @@ async function handleDeleteMessage(req, res) {
     return;
   }
 
+  const original = state.messagesCache.get(chatId)?.messages.find((entry) => entry.id === messageId);
   try {
-    const message = await withTimeout(
-      () => client.getMessageById(messageId),
-      PUPPETEER_OP_TIMEOUT_MS,
-      `getMessageById(${messageId})`,
-    );
-    if (!message) {
-      json(res, 404, { success: false, error: "message not found" });
-      return;
+    if (everyone) {
+      const message = await withTimeout(
+        () => client.getMessageById(messageId),
+        PUPPETEER_OP_TIMEOUT_MS,
+        `getMessageById(${messageId})`,
+      );
+      if (!message) {
+        json(res, 404, { success: false, error: "message not found" });
+        return;
+      }
+      await withTimeout(
+        () => message.delete(true, true),
+        PUPPETEER_OP_TIMEOUT_MS * 2,
+        `deleteMessage(${messageId})`,
+      );
+    } else {
+      // getMessageById's fallback getMessagesById and Message.delete's chat
+      // lookup can throw minified `r` on current WhatsApp Web. The thread is
+      // already loaded, so delete its exact Store model without either lookup.
+      await withTimeout(
+        () => deleteMessageForMeCompat(chatId, messageId),
+        PUPPETEER_OP_TIMEOUT_MS * 2,
+        `deleteMessageForMe(${messageId})`,
+      );
     }
 
-    await withTimeout(
-      () => message.delete(everyone, true),
-      PUPPETEER_OP_TIMEOUT_MS * 2,
-      `deleteMessage(${messageId})`,
-    );
-
     await queueMessagesFetch(chatId, MESSAGES_CACHE_LIMIT).catch(() => null);
+    // WhatsApp removes "delete for me" from its history. Keep only the ID,
+    // timestamp and direction locally so the thread retains its position.
+    const cached = state.messagesCache.get(chatId);
+    if (!everyone && original) {
+      const items = state.deletedPlaceholders.get(chatId) || [];
+      if (!items.some((entry) => entry.id === messageId)) {
+        items.push({ id: messageId, type: "deleted", timestamp: original.timestamp,
+          from_me: original.from_me, body: "" });
+        state.deletedPlaceholders.set(chatId, items.slice(-200));
+        try {
+          saveDeletedPlaceholders();
+        } catch (err) {
+          console.warn("[bridge] Could not persist deleted message placeholder:", err?.message || err);
+        }
+      }
+    }
+    if (cached) cached.messages = mergeDeletedPlaceholders(chatId, cached.messages);
     refreshChatsFromPuppeteer().catch(() => {});
 
     json(res, 200, {
@@ -2157,7 +2400,8 @@ async function handleDeleteMessage(req, res) {
     });
   } catch (err) {
     console.error(`[bridge] deleteMessage failed:`, err?.stack || err?.message || err);
-    json(res, 500, { success: false, error: err?.message || String(err) });
+    const detail = String(err?.message || err);
+    json(res, 500, { success: false, error: detail === "r" ? "WhatsApp Web rejected local deletion (r)" : detail });
   }
 }
 
@@ -2399,13 +2643,13 @@ async function handleSendAudio(req, res) {
       : await transcodeToMp3(audioData);
     const message = await sendAudioClip(chatId, encodedAudio, OUTPUT_AUDIO_MIMETYPE);
 
-    // Immediately append to cache so the UI sees it
-    appendMessageToCache(message);
+    // Make the message visible to the immediate frontend refresh.
+    const normalizedMessage = await appendMessageToCache(message);
     updateChatOnMessage(message);
 
     json(res, 200, {
       success: true,
-      message: await normalizeMessage(message),
+      message: normalizedMessage,
     });
   } catch (err) {
     console.error(
@@ -2459,15 +2703,28 @@ async function handleSendMedia(req, res, { imageOnly = false } = {}) {
   try {
     const message = await sendMediaAttachment(chatId, mediaData, mimetype, filename, caption, quotedMessageId);
 
-    appendMessageToCache(message);
+    const normalizedMessage = await appendMessageToCache(message);
     updateChatOnMessage(message);
 
     json(res, 200, {
       success: true,
-      message: await normalizeMessage(message),
+      message: normalizedMessage,
     });
   } catch (err) {
-    console.error(`[bridge] sendMedia failed:`, err?.stack || err?.message || err);
+    const detail = err?.stack || err?.message || String(err);
+    console.error(`[bridge] sendMedia failed:`, detail);
+    // The app runs this bridge with stdout/stderr discarded. Keep the failure
+    // stack (never message/media contents) so WhatsApp Web compatibility errors
+    // can be diagnosed from the installed app after a failed send.
+    try {
+      fs.appendFileSync(
+        path.join(AUTH_DATA_DIR, "send-media-errors.log"),
+        `[${new Date().toISOString()}] ${detail}\n\n`,
+        "utf8",
+      );
+    } catch (logErr) {
+      console.error("[bridge] could not persist send-media diagnostic:", logErr?.message || logErr);
+    }
     json(res, 500, { success: false, error: err?.message || String(err) });
   }
 }

@@ -1,8 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "WhatsApp Quick",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "identifier": "com.javivera.whatsappquick",
+  "plugins": {
+    "deep-link": {
+      "desktop": { "schemes": ["whatsapp-quick"] }
+    }
+  },
   "build": {
     "frontendDist": "../ui"
   },

@@ -5,6 +5,7 @@
 const CHAT_LIMIT = 300;
 const CHATS_POLL_MS = 5000;
 const THREAD_POLL_MS = 4000;
+const AUDIO_RATES = [1, 1.5, 2];
 
 const el = {
   shell: document.querySelector(".shell"),
@@ -15,6 +16,7 @@ const el = {
   chatsEmpty: document.getElementById("chats-empty"),
   threadHead: document.getElementById("thread-head"),
   messages: document.getElementById("messages"),
+  messagesInner: document.getElementById("messages-inner"),
   msgMenu: document.getElementById("msg-menu"),
   composer: document.getElementById("composer"),
   composerBanner: document.getElementById("composer-banner"),
@@ -31,7 +33,9 @@ const state = {
   chats: [],
   filtered: [],
   activeChatId: null,
+  linkChat: null,
   messages: [],
+  deletedPlaceholders: new Map(), // chat ID -> locally deleted messages (poll fallback)
   selected: 0,
   pane: "chats", // "chats" | "messages" | "input"
   threadPane: "input", // remembered right-side pane (input or messages)
@@ -47,6 +51,9 @@ const state = {
   menuConfirm: false,
   playingId: null,
   playingAudio: null,
+  audioCleanup: null,
+  audioRequestId: 0,
+  audioPlaybackRate: 1,
   bridgeReady: false,
   pinBottom: false,
   inflight: false,
@@ -140,6 +147,54 @@ async function ensureProfilePic(chatId) {
   }
 }
 
+/* ---------------- incoming Safari links ---------------- */
+
+function parseQuickLink(raw) {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "whatsapp-quick:" || url.hostname !== "send" ||
+        (url.pathname !== "" && url.pathname !== "/")) return null;
+    const phone = url.searchParams.get("phone");
+    if (!phone || !/^[1-9][0-9]{5,14}$/.test(phone)) return null;
+    const text = url.searchParams.get("text") || "";
+    if (text.length > 10000) return null;
+    return { phone, text };
+  } catch (_) {
+    return null;
+  }
+}
+
+let pendingQuickLink = null;
+let quickLinkReady = false;
+let quickLinkSequence = 0;
+
+async function acceptQuickLink(raw) {
+  pendingQuickLink = raw;
+  if (!quickLinkReady) return;
+  const sequence = ++quickLinkSequence;
+  const link = parseQuickLink(pendingQuickLink);
+  pendingQuickLink = null;
+  if (!link) {
+    toast("Invalid WhatsApp Quick link");
+    return;
+  }
+  // Cold-launch show events can precede WebView subscription; this one cannot.
+  invoke("show_quick_cmd").catch(() => {});
+  const chatId = `${link.phone}@c.us`;
+  const existing = state.chats.find((chat) => chat.id === chatId);
+  if (!existing) {
+    state.linkChat = { id: chatId, name: `+${link.phone}`, is_group: false };
+    state.chats.unshift(state.linkChat);
+    applyFilter();
+  }
+  await openChat(chatId);
+  if (sequence !== quickLinkSequence) return;
+  // A link never sends. Preserve the currently typed draft when no text was supplied.
+  if (link.text) el.input.value = link.text;
+  autosize();
+  setPane("input");
+}
+
 /* ---------------- bridge ---------------- */
 
 async function ensureBridge() {
@@ -168,6 +223,23 @@ let toastTimer = null;
 // Last seen scrollTop of the thread: used to tell user scroll-ups apart
 // from our own programmatic scrolls to the bottom (which only move down).
 let lastMsgTop = 0;
+// WebKit (WKWebView) often fires `scroll` synchronously when we change
+// scrollTop or wipe the thread. Those events are not the user; ignore them
+// for one frame so they can't kill the pin-to-bottom.
+let ignorePinRelease = 0;
+let threadRetryTimer = null;
+// Keep message polls ordered. A slow older request must never overwrite a
+// newer thread snapshot, and a refresh requested while one is running must
+// be replayed as soon as the current request finishes.
+let threadRefreshInFlight = false;
+let threadRefreshQueued = false;
+function suppressPinRelease() {
+  ignorePinRelease += 1;
+  requestAnimationFrame(() => {
+    ignorePinRelease = Math.max(0, ignorePinRelease - 1);
+    lastMsgTop = el.messages.scrollTop;
+  });
+}
 function toast(text) {
   el.toast.textContent = String(text || "error");
   el.toast.classList.remove("hidden");
@@ -187,8 +259,21 @@ function isGroupChat(c) {
   return String(c.id || "").endsWith("@g.us");
 }
 
+function isStatusChat(c) {
+  return String((c && c.id) || "").toLowerCase() === "status@broadcast";
+}
+
+function chatActivitySignature(chat) {
+  if (!chat) return "";
+  const last = chat.last_message || {};
+  return `${chat.timestamp}|${last.type || ""}|${last.body || ""}|${last.from_me ? 1 : 0}`;
+}
+
 function visibleChats() {
-  return state.chats.filter((c) => (state.groupMode ? isGroupChat(c) : !isGroupChat(c)));
+  return state.chats.filter((c) => {
+    if (isStatusChat(c)) return false;
+    return state.groupMode ? isGroupChat(c) : !isGroupChat(c);
+  });
 }
 
 function updateSidebarModeUI() {
@@ -211,17 +296,34 @@ async function refreshChats() {
   if (state.inflight) return;
   state.inflight = true;
   try {
+    const previousActive = state.chats.find((c) => c.id === state.activeChatId);
+    const previousActivity = chatActivitySignature(previousActive);
     const payload = await invoke("bridge_get_chats", {
       limit: CHAT_LIMIT,
       includeGroups: true,
       query: null,
     });
     const chats = Array.isArray(payload && payload.chats) ? payload.chats : [];
+    // A linked number may not be in the recent-chat cache yet.
+    if (state.linkChat && !chats.some((chat) => chat.id === state.linkChat.id)) {
+      chats.unshift(state.linkChat);
+    }
     state.chats = chats;
     state.bridgeReady = true;
     setStatus("ready");
     applyFilter();
     state.lastChatsAt = Date.now();
+
+    // The sidebar cache is updated by the same live event as the message
+    // cache. If the open chat's preview changed, refresh its thread now
+    // instead of leaving the two panes out of sync until the next poll or
+    // until the user focuses the conversation again.
+    const nextActive = chats.find((c) => c.id === state.activeChatId);
+    const nextActivity = chatActivitySignature(nextActive);
+    if (previousActive && nextActive && nextActivity !== previousActivity) {
+      refreshThread();
+      scheduleThreadRetry(state.activeChatId);
+    }
   } catch (err) {
     setStatus("down");
     showFault(`chats: ${err && err.message ? err.message : err}`);
@@ -253,30 +355,50 @@ async function openChat(chatId) {
   }
   renderChats();
   invoke("bridge_mark_seen", { chatId }).catch(() => {});
-  // Pin to the bottom while the new thread (and its late-loading media)
-  // settles, so expanding images can't leave us stuck mid-thread.
-  state.pinBottom = true;
+  // Stick to the bottom while the new thread (and its late-loading media)
+  // settles, so expanding images can't leave us stuck mid-thread. Sticky
+  // until the user scrolls up — a fixed timeout can't cover slow photo
+  // fetches (bridge fetch + retry backoff), and an expired pin left late
+  // images expanding with nothing willing to re-pin the view.
+  stickToBottom();
   renderThreadHead(chat);
-  el.messages.innerHTML = "";
+  // Never assign scrollTop=0 here: in WebKit that fires a sync scroll
+  // event that looks like the user scrolled up and clears the pin, so the
+  // new thread lands mid-history. Wiping the inner list is enough; the
+  // browser clamps any leftover scrollTop, then refreshThread pins bottom.
+  suppressPinRelease();
+  el.messagesInner.replaceChildren();
+  lastMsgTop = el.messages.scrollTop;
   state.messages = [];
   state.lastThreadKey = null;
-  el.messages.scrollTop = 0;
-  lastMsgTop = 0;
   await refreshThread();
   renderChats();
   setPane("input");
-  setTimeout(() => {
-    state.pinBottom = false;
-  }, 4000);
+  if (state.pinBottom) scrollToBottom();
+}
+
+function mergeLocalDeletedMessages(chatId, messages) {
+  const placeholders = state.deletedPlaceholders.get(chatId) || [];
+  if (!placeholders.length) return messages;
+  const ids = new Set(placeholders.map((msg) => msg.id));
+  return messages.filter((msg) => !ids.has(msg.id)).concat(placeholders)
+    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
 }
 
 async function refreshThread() {
   const chatId = state.activeChatId;
   if (!chatId) return;
+  if (threadRefreshInFlight) {
+    threadRefreshQueued = true;
+    return;
+  }
+  threadRefreshInFlight = true;
   try {
     const payload = await invoke("bridge_get_messages", { chatId, limit: 60 });
     if (chatId !== state.activeChatId) return;
-    const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
+    const messages = mergeLocalDeletedMessages(chatId,
+      Array.isArray(payload && payload.messages) ? payload.messages : []);
+    const loading = Boolean(payload && payload.loading);
     // Capture before the re-render: polls must not yank a user who scrolled
     // up to read history back to the bottom.
     const wasNear = state.messages.length === 0 || isNearBottom(120);
@@ -296,20 +418,26 @@ async function refreshThread() {
     const key = messages
       .map(
         (m) =>
-          `${m.id}|${m.type}|${m.body}|${(Array.isArray(m.reactions) ? m.reactions : []).map((r) => `${r.emoji}${r.count}`).join(",")}`,
+          `${m.id}|${m.type}|${m.body}|${m.quoted_msg ? `${m.quoted_msg.from_me ? 1 : 0}:${m.quoted_msg.type || ""}:${m.quoted_msg.body || ""}` : ""}|${(Array.isArray(m.reactions) ? m.reactions : []).map((r) => `${r.emoji}${r.count}`).join(",")}`,
       )
       .join("~");
     state.messages = messages;
+    if (state.replyToId) updateComposerBanner();
     if (state.selectedMsgId && !messages.some((m) => m.id === state.selectedMsgId)) {
       state.selectedMsgId = null;
     }
+    const contentChanged = key !== state.lastThreadKey;
     const shouldScroll = state.pinBottom || (wasNear && grew);
-    if (key === state.lastThreadKey && !shouldScroll) {
-      // No visible change: skip the re-render so polling can't flicker the
-      // view or steal the scroll position while reading history.
-    } else {
+    if (contentChanged) {
       state.lastThreadKey = key;
       renderMessages(shouldScroll);
+    } else if (shouldScroll && !isNearBottom(2)) {
+      // No new content: never rebuild here (that would reset every photo
+      // to its placeholder and flicker). Just re-assert the bottom in case
+      // late-decoding images expanded above us — scrollHeight growth fires
+      // no scroll event, so without this a slow photo can strand the view
+      // mid-thread with no image-load left to re-pin it.
+      scrollToBottom();
     }
     // The early-out above means a media load that failed once would never be
     // retried by a poll; retry the failed thumbnails directly on the DOM.
@@ -324,9 +452,24 @@ async function refreshThread() {
       invoke("bridge_mark_seen", { chatId }).catch(() => {});
     }
     state.lastThreadAt = Date.now();
+    if (loading) scheduleThreadRetry(chatId);
   } catch (err) {
     /* transient; the next poll retries */
+  } finally {
+    threadRefreshInFlight = false;
+    if (threadRefreshQueued) {
+      threadRefreshQueued = false;
+      queueMicrotask(() => refreshThread());
+    }
   }
+}
+
+function scheduleThreadRetry(chatId) {
+  if (threadRetryTimer) clearTimeout(threadRetryTimer);
+  threadRetryTimer = setTimeout(() => {
+    threadRetryTimer = null;
+    if (state.activeChatId === chatId) refreshThread();
+  }, 280);
 }
 
 /* ---------------- rendering ---------------- */
@@ -385,7 +528,9 @@ function renderChats() {
     const last = chat.last_message || {};
     const body = clamp(String(last.body || "").replace(/\s+/g, " ").trim(), 160);
     const mediaFallback = last.type && last.type !== "chat" ? `[${mediaLabel(last)}]` : "";
-    const text = body || mediaFallback;
+    // Media bodies may contain encoded bytes; never expose them in the sidebar.
+    const text = isAudioType(last) ? "🎤 Voice message"
+      : last.type === "image" || last.type === "sticker" ? "📷 Photo" : body || mediaFallback;
     if (last.from_me) {
       // Make it obvious the preview is our own message, not theirs.
       preview.textContent = text ? `You: ${text}` : "You";
@@ -428,9 +573,33 @@ function renderThreadHead(chat) {
   el.threadHead.append(name, meta);
 }
 
+/** Text shown for a quoted original: body, or a [media] fallback. */
+function quotedSnippet(quoted) {
+  const raw = String((quoted && quoted.body) || "").replace(/\s+/g, " ").trim();
+  if (raw) return clamp(raw, 180);
+  const type = String((quoted && quoted.type) || "").toLowerCase();
+  if (type && type !== "chat") return `[${mediaLabel({ type })}]`;
+  return "[message]";
+}
+
+/** WhatsApp-style quoted block rendered at the top of a reply bubble. */
+function renderQuoted(quoted, chat) {
+  if (!quoted) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "quote" + (quoted.from_me ? " quote-mine" : " quote-theirs");
+  const who = document.createElement("span");
+  who.className = "quote-who";
+  who.textContent = quoted.from_me ? "You" : (chat && !chat.is_group ? (chat.name || "Them") : "Them");
+  const text = document.createElement("span");
+  text.className = "quote-text";
+  text.textContent = quotedSnippet(quoted);
+  wrap.append(who, text);
+  return wrap;
+}
+
 function renderMessages(scrollToEnd) {
   const chat = state.chats.find((c) => c.id === state.activeChatId);
-  const isGroup = Boolean(chat && chat.is_group);
+  const isGroup = Boolean(chat && isGroupChat(chat));
   const frag = document.createDocumentFragment();
 
   for (const msg of state.messages) {
@@ -438,7 +607,7 @@ function renderMessages(scrollToEnd) {
     const isChat = type === "chat" && String(msg.body || "").trim();
     const isSystem = ["revoked", "call_log", "e2e_notification", "notification_template"].includes(type);
     const selected = msg.id === state.selectedMsgId;
-    const playing = msg.id === state.playingId;
+    const playing = msg.id === state.playingId && !state.playingAudio?.paused;
 
     const node = document.createElement("div");
     node.className =
@@ -455,38 +624,35 @@ function renderMessages(scrollToEnd) {
       frag.append(node);
       continue;
     }
+    if (type === "deleted") {
+      node.classList.add("deleted");
+      node.textContent = "This message was deleted";
+      const stamp = document.createElement("span");
+      stamp.className = "stamp";
+      stamp.textContent = fmtTime(msg.timestamp);
+      node.append(stamp);
+      frag.append(node);
+      continue;
+    }
 
-    if (isGroup && !msg.from_me && msg.author) {
+    if (isGroup) {
       const who = document.createElement("span");
       who.className = "who";
-      who.textContent = String(msg.author).replace(/@.*$/, "");
+      who.textContent = msg.from_me
+        ? "You"
+        : (msg.author_name || String(msg.author || "Unknown sender").replace(/@.*$/, ""));
       node.append(who);
+    }
+
+    if (msg.quoted_msg) {
+      const quoted = renderQuoted(msg.quoted_msg, chat);
+      if (quoted) node.append(quoted);
     }
 
     if (isChat) {
       node.append(renderBodyWithLinks(msg));
     } else if (type === "image" || type === "video" || type === "sticker") {
-      const cached = state.mediaCache.get(msg.id);
-      const thumb = document.createElement("img");
-      thumb.className = "media-thumb";
-      thumb.dataset.msgId = msg.id;
-      thumb.alt = type === "video" ? "video" : "photo";
-      thumb.loading = "lazy";
-      // Late-loading media expands the thread after the initial
-      // scroll-to-bottom, leaving the view stuck mid-thread. Re-pin on
-      // load while the new chat is settling (or the user was at bottom).
-      thumb.addEventListener("load", () => {
-        if (state.pinBottom || isNearBottom()) scrollToBottom();
-      });
-      if (cached && cached.src) {
-        thumb.src = cached.src;
-        thumb.classList.add("loaded");
-      } else {
-        thumb.src = TRANSPARENT_PIXEL;
-        if (state.mediaFailures.has(msg.id)) markThumbFailed(thumb, msg.id);
-        ensureMediaThumb(msg.id, thumb);
-      }
-      node.append(thumb);
+      node.append(renderMediaThumb(msg));
       if (msg.body) {
         const caption = document.createElement("div");
         caption.className = "caption";
@@ -494,16 +660,52 @@ function renderMessages(scrollToEnd) {
         node.append(caption);
       }
     } else {
-      const chip = document.createElement("span");
-      chip.className = "media-chip";
-      const label = playing ? "🔊 playing" : `${isAudioType(msg) ? "▶ " : "▸ "}${mediaLabel(msg)}`;
-      chip.textContent = label;
-      chip.title = msg.title || msg.filename || (isAudioType(msg) ? "Play" : "Open");
-      chip.addEventListener("click", () => {
-        if (isAudioType(msg)) playAudio(msg);
-        else openMediaExternally(msg);
-      });
-      node.append(chip);
+      if (isAudioType(msg)) {
+        const player = document.createElement("div");
+        player.className = "audio-player";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "audio-toggle";
+        button.addEventListener("click", () => playAudio(msg));
+        const details = document.createElement("div");
+        details.className = "audio-details";
+        const progress = document.createElement("input");
+        progress.type = "range";
+        progress.className = "audio-progress";
+        progress.min = "0";
+        progress.max = "100";
+        progress.step = "0.1";
+        progress.value = "0";
+        progress.setAttribute("aria-label", "Seek voice message");
+        progress.addEventListener("input", () => {
+          const audio = state.playingId === msg.id ? state.playingAudio : null;
+          if (audio && Number.isFinite(audio.duration) && audio.duration > 0) {
+            audio.currentTime = Number(progress.value);
+            updateAudioPlaybackUI();
+          }
+        });
+        const times = document.createElement("div");
+        times.className = "audio-times";
+        const elapsed = document.createElement("span");
+        elapsed.className = "audio-elapsed";
+        const remaining = document.createElement("span");
+        remaining.className = "audio-remaining";
+        times.append(elapsed, remaining);
+        details.append(progress, times);
+        const speed = document.createElement("button");
+        speed.type = "button";
+        speed.className = "audio-speed";
+        speed.addEventListener("click", () => changeAudioPlaybackRate(1));
+        player.append(button, details, speed);
+        node.append(player);
+      } else {
+        const chip = document.createElement("span");
+        chip.className = "media-chip";
+        chip.textContent = `▸ ${mediaLabel(msg)}`;
+        chip.title = msg.title || msg.filename || "Open";
+        chip.addEventListener("click", () => openMediaExternally(msg));
+        node.append(chip);
+      }
       if (msg.body) {
         const caption = document.createElement("div");
         caption.className = "caption";
@@ -529,7 +731,8 @@ function renderMessages(scrollToEnd) {
     frag.append(node);
   }
 
-  el.messages.replaceChildren(frag);
+  el.messagesInner.replaceChildren(frag);
+  updateAudioPlaybackUI();
   if (scrollToEnd) {
     // Scroll now plus on the next frames: image placeholders have no real
     // size yet, so a single synchronous scroll lands short. The deferred
@@ -548,7 +751,24 @@ function renderMessages(scrollToEnd) {
 }
 
 function scrollToBottom() {
+  suppressPinRelease();
   el.messages.scrollTop = el.messages.scrollHeight;
+  // Keep the scroll listener honest: without this, the async scroll event
+  // from this programmatic scroll compares against a stale lastMsgTop and
+  // can misread our own scroll-to-bottom as the user scrolling up,
+  // killing the pin mid-settle.
+  lastMsgTop = el.messages.scrollTop;
+}
+
+// Stick the thread to the bottom until the user scrolls up. Set on
+// open-chat and on every new outgoing message: the re-render resets every
+// photo to its small placeholder and the real bytes decode late (slow
+// bridge fetches, retry backoff), each expansion pushing the bottom further
+// away. Only a user scroll-up clears it (see the messages scroll listener),
+// so late images always have something willing to re-pin the view — a
+// fixed-duration pin expired too early and stranded the view mid-thread.
+function stickToBottom() {
+  state.pinBottom = true;
 }
 
 function isNearBottom(px = 80) {
@@ -574,6 +794,46 @@ function cacheMediaEntry(messageId, entry) {
     if (oldestKey === undefined) break;
     state.mediaCache.delete(oldestKey);
   }
+}
+
+function renderMediaThumb(msg) {
+  const type = String(msg.type || "").toLowerCase();
+  const cached = state.mediaCache.get(msg.id);
+  const nativeThumb = String(msg.thumbnail || "").trim();
+  const thumb = document.createElement("img");
+  thumb.className = "media-thumb";
+  thumb.dataset.msgId = msg.id;
+  thumb.alt = type === "video" ? "video" : "photo";
+  thumb.loading = "lazy";
+  // Late-loading media expands the thread after the initial
+  // scroll-to-bottom, leaving the view stuck mid-thread. Re-pin on
+  // load while the new chat is settling (or the user was at bottom).
+  thumb.addEventListener("load", () => {
+    if (state.pinBottom || isNearBottom()) scrollToBottom();
+  });
+  if (cached && cached.src) {
+    thumb.src = cached.src;
+    thumb.classList.add("loaded");
+  } else if (nativeThumb) {
+    thumb.src = nativeThumb;
+    thumb.classList.add("loaded");
+    cacheMediaEntry(msg.id, {
+      kind: type === "video" ? "video" : "image",
+      src: nativeThumb,
+    });
+  } else {
+    thumb.src = TRANSPARENT_PIXEL;
+    if (state.mediaFailures.has(msg.id)) markThumbFailed(thumb, msg.id);
+    ensureMediaThumb(msg.id, thumb);
+  }
+  if (type !== "video") return thumb;
+  const wrap = document.createElement("div");
+  wrap.className = "video-thumb-wrap";
+  const play = document.createElement("span");
+  play.className = "video-play-badge";
+  play.setAttribute("aria-hidden", "true");
+  wrap.append(thumb, play);
+  return wrap;
 }
 
 async function fetchMediaSrc(messageId) {
@@ -698,17 +958,84 @@ async function ensureMediaThumb(messageId, imgEl) {
   }
 }
 
-async function playAudio(msg) {
-  if (state.playingAudio) {
-    state.playingAudio.pause();
-    state.playingAudio = null;
-    state.playingId = null;
+function formatAudioTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "--:--";
+  const whole = Math.floor(seconds);
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+}
+
+// Update only the player controls: rebuilding the thread detaches messages
+// and can clamp scrollTop while someone is listening.
+function updateAudioPlaybackUI() {
+  for (const player of el.messagesInner.querySelectorAll(".audio-player")) {
+    const node = player.closest(".msg");
+    const active = node.dataset.messageId === state.playingId && state.playingAudio;
+    const audio = active ? state.playingAudio : null;
+    const duration = audio && Number.isFinite(audio.duration) && audio.duration > 0
+      ? audio.duration
+      : Number(state.messages.find((m) => m.id === node.dataset.messageId)?.duration_seconds) || 0;
+    const current = audio ? Math.min(audio.currentTime || 0, duration) : 0;
+    const playing = Boolean(audio && !audio.paused);
+    const progress = player.querySelector(".audio-progress");
+    const button = player.querySelector(".audio-toggle");
+    node.classList.toggle("playing", playing);
+    button.textContent = playing ? "❚❚" : "▶";
+    button.setAttribute("aria-label", playing ? "Pause voice message" : "Play voice message");
+    button.title = playing ? "Pause" : "Play";
+    const speed = player.querySelector(".audio-speed");
+    speed.textContent = `${state.audioPlaybackRate}×`;
+    speed.title = "Playback speed (← slower, → faster)";
+    speed.setAttribute("aria-label", `Playback speed ${state.audioPlaybackRate} times; click to increase`);
+    progress.disabled = !audio || !Number.isFinite(audio.duration) || audio.duration <= 0;
+    progress.max = String(duration || 100);
+    progress.value = String(current);
+    progress.style.setProperty("--audio-progress", `${duration ? (current / duration) * 100 : 0}%`);
+    const remaining = duration ? `−${formatAudioTime(Math.max(0, duration - current))}` : "−--:--";
+    player.querySelector(".audio-elapsed").textContent = formatAudioTime(current);
+    player.querySelector(".audio-remaining").textContent = remaining;
+    progress.setAttribute("aria-valuetext", `${formatAudioTime(current)} elapsed, ${remaining} remaining`);
   }
+}
+
+function changeAudioPlaybackRate(direction) {
+  const index = AUDIO_RATES.indexOf(state.audioPlaybackRate);
+  state.audioPlaybackRate = AUDIO_RATES[Math.max(0, Math.min(AUDIO_RATES.length - 1, index + direction))];
+  if (state.playingAudio) state.playingAudio.playbackRate = state.audioPlaybackRate;
+  updateAudioPlaybackUI();
+}
+
+function stopAudioPlayback() {
+  if (state.playingAudio) state.playingAudio.pause();
+  if (state.audioCleanup) state.audioCleanup();
+  state.audioCleanup = null;
+  state.playingAudio = null;
+  state.playingId = null;
+  updateAudioPlaybackUI();
+}
+
+async function playAudio(msg) {
+  if (state.playingAudio && state.playingId === msg.id) {
+    if (state.playingAudio.paused) {
+      try {
+        await state.playingAudio.play();
+      } catch (_) {
+        // Leave it paused if the browser rejects resuming playback.
+      }
+    } else {
+      state.playingAudio.pause();
+    }
+    updateAudioPlaybackUI();
+    return;
+  }
+  const requestId = ++state.audioRequestId;
+  stopAudioPlayback();
   try {
+    const chatId = state.activeChatId;
     const payload = await invoke("bridge_get_media", {
-      chatId: state.activeChatId,
+      chatId,
       messageId: msg.id,
     });
+    if (requestId !== state.audioRequestId || chatId !== state.activeChatId) return;
     const base64 = payload && payload.data;
     if (!base64) return;
     const mime = payload.mimetype || "audio/ogg; codecs=opus";
@@ -718,21 +1045,22 @@ async function playAudio(msg) {
     const blob = new Blob([bytes], { type: mime });
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
+    audio.playbackRate = state.audioPlaybackRate;
     state.playingId = msg.id;
     state.playingAudio = audio;
-    renderMessages(false);
-    const stop = () => {
-      state.playingId = null;
-      state.playingAudio = null;
-      URL.revokeObjectURL(url);
-      renderMessages(false);
+    state.audioCleanup = () => URL.revokeObjectURL(url);
+    audio.onloadedmetadata = updateAudioPlaybackUI;
+    audio.ontimeupdate = updateAudioPlaybackUI;
+    audio.onplay = updateAudioPlaybackUI;
+    audio.onpause = updateAudioPlaybackUI;
+    audio.onended = () => {
+      if (state.playingAudio === audio) stopAudioPlayback();
     };
-    audio.onended = stop;
-    audio.onerror = stop;
+    audio.onerror = audio.onended;
     await audio.play();
-  } catch (err) {
-    state.playingId = null;
-    state.playingAudio = null;
+    updateAudioPlaybackUI();
+  } catch (_) {
+    if (requestId === state.audioRequestId) stopAudioPlayback();
   }
 }
 
@@ -797,26 +1125,9 @@ async function openMediaExternally(msg) {
   }
 }
 
-/**
- * Enter on a selected message does the obvious thing: play a voice note,
- * open a link in the browser, or open an image/video/document in the OS
- * default app. Plain text messages fall back to the action menu.
- */
+/** Enter on any selected message opens its actions, including open/play. */
 function performPrimaryAction(msg) {
-  if (!msg) return;
-  if (isAudioType(msg)) {
-    playAudio(msg);
-    return;
-  }
-  const linkUrl = primaryMessageUrl(msg);
-  if (linkUrl && !msg.has_media) {
-    openLink(linkUrl);
-    return;
-  }
-  if (hasOpenableMedia(msg)) {
-    openMediaExternally(msg);
-    return;
-  }
+  if (!msg || msg.type === "deleted") return;
   openMenuForSelected();
 }
 
@@ -1000,6 +1311,9 @@ async function stopAndSendRecording() {
   });
 
   try {
+    // Same stick as a typed send: the new voice note re-renders the thread
+    // and late-decoding photos above it would otherwise strand the view.
+    stickToBottom();
     await invoke("bridge_send_audio", { chatId, audioData: base64, mimetype: mimeType });
     toast("Voice note sent");
     await refreshThread();
@@ -1015,7 +1329,15 @@ function updateComposerBanner() {
     el.composerBanner.textContent = "✎ Editing message — Esc to cancel";
     el.composerBanner.classList.remove("hidden");
   } else if (state.replyToId) {
-    el.composerBanner.textContent = "↩ Replying — Esc to cancel";
+    const target = state.messages.find((m) => m.id === state.replyToId);
+    const raw = target
+      ? String(target.body || "").replace(/\s+/g, " ").trim() ||
+        (target.type && String(target.type).toLowerCase() !== "chat"
+          ? `[${mediaLabel(target)}]`
+          : "")
+      : "";
+    const snippet = raw ? ` “${clamp(raw, 80)}”` : "";
+    el.composerBanner.textContent = `↩ Replying${snippet} — Esc to cancel`;
     el.composerBanner.classList.remove("hidden");
   } else {
     el.composerBanner.classList.add("hidden");
@@ -1055,6 +1377,14 @@ async function send() {
   // Images can't be applied as a text edit: pasting while editing sends a
   // new media message instead.
   const editing = pending.length > 0 ? null : state.editingMessageId;
+
+  // A new message must land the view at the bottom. The re-render resets
+  // every photo to its small placeholder and decodes the real bytes late,
+  // so a single synchronous scroll lands short and each late image leaves
+  // us further from the bottom (the "random" jump). Stick until the user
+  // scrolls up; a user scroll-up still cancels it. Edits stay unstuck so a
+  // correction while reading history doesn't yank the view away.
+  if (!editing) stickToBottom();
 
   el.input.value = "";
   autosize();
@@ -1102,12 +1432,30 @@ async function send() {
 }
 
 async function deleteMessage(msg) {
+  const chatId = state.activeChatId;
   try {
     await invoke("bridge_delete_message", {
-      chatId: state.activeChatId,
+      chatId,
       messageId: msg.id,
       everyone: false,
     });
+    if (state.activeChatId !== chatId) return;
+    const index = state.messages.findIndex((m) => m.id === msg.id);
+    if (index >= 0) {
+      const placeholder = {
+        id: msg.id, type: "deleted", timestamp: msg.timestamp,
+        from_me: msg.from_me, body: "",
+      };
+      state.messages[index] = placeholder;
+      const placeholders = state.deletedPlaceholders.get(chatId) || [];
+      state.deletedPlaceholders.set(chatId, placeholders.concat(placeholder).slice(-200));
+      state.localReactions.delete(msg.id);
+      if (state.playingId === msg.id) {
+        ++state.audioRequestId;
+        stopAudioPlayback();
+      }
+      renderMessages(false);
+    }
     refreshThread();
   } catch (err) {
     toast("Delete failed: " + (err && err.message ? err.message : err));
@@ -1363,16 +1711,18 @@ el.composer.addEventListener("drop", (event) => {
 function buildMenuItems(msg) {
   if (state.menuConfirm) {
     return [
-      { id: "delete-confirm", label: "🗑 Delete this message" },
+      { id: "delete-confirm", label: "🗑 Delete for me (confirm)" },
       { id: "cancel", label: "Cancel" },
     ];
   }
   const items = [];
   if (isAudioType(msg)) items.push({ id: "play", label: "▶ Play voice note" });
+  if (hasOpenableMedia(msg)) items.push({ id: "open-media", label: `↗ Open ${mediaLabel(msg)}` });
+  else if (primaryMessageUrl(msg)) items.push({ id: "open-link", label: "↗ Open link" });
   items.push({ id: "reply", label: "↩ Reply" });
   if (String(msg.body || "").trim()) items.push({ id: "copy", label: "⧉ Copy text" });
   if (msg.from_me && String(msg.body || "").trim()) items.push({ id: "edit", label: "✎ Edit" });
-  if (msg.from_me) items.push({ id: "delete", label: "🗑 Delete" });
+  items.push({ id: "delete", label: "🗑 Delete for me" });
   items.push({ id: "react", label: "👍  React 👍", emoji: "👍" });
   items.push({ id: "react", label: "❤️  React ❤️", emoji: "❤️" });
   items.push({ id: "react", label: "😂  React 😂", emoji: "😂" });
@@ -1398,11 +1748,11 @@ function renderMenu() {
 
 function openMenuForSelected() {
   const msg = state.messages.find((m) => m.id === state.selectedMsgId);
-  if (!msg) return;
+  if (!msg || msg.type === "deleted") return;
   state.menuMsg = msg;
+  state.menuConfirm = false;
   state.menuItems = buildMenuItems(msg);
   state.menuIndex = 0;
-  state.menuConfirm = false;
   state.menuOpen = true;
   renderMenu();
 }
@@ -1421,6 +1771,14 @@ async function activateMenuItem(item) {
     case "play":
       closeMenu();
       playAudio(msg);
+      break;
+    case "open-media":
+      closeMenu();
+      openMediaExternally(msg);
+      break;
+    case "open-link":
+      closeMenu();
+      openLink(primaryMessageUrl(msg));
       break;
     case "reply":
       closeMenu();
@@ -1495,11 +1853,11 @@ function currentMsgIndex() {
   return state.messages.findIndex((m) => m.id === state.selectedMsgId);
 }
 
-function enterMessages() {
+function enterMessages(fromComposer = false) {
   if (!state.messages.length) return; // nothing to focus, stay put
   const idx = currentMsgIndex();
-  state.selectedMsgId =
-    idx >= 0 ? state.messages[idx].id : state.messages[state.messages.length - 1].id;
+  state.selectedMsgId = fromComposer || idx < 0
+    ? state.messages[state.messages.length - 1].id : state.messages[idx].id;
   setPane("messages");
   updateMessageSelection();
   scrollMsgIntoView(1);
@@ -1518,10 +1876,8 @@ function selectMessage(delta) {
 // Selection-only update: toggling the ring in place instead of rebuilding
 // all 60 bubbles (which re-decoded every image and flashed on each ↑/↓).
 function updateMessageSelection() {
-  for (const node of el.messages.children) {
-    if (node.dataset && node.dataset.messageId !== undefined) {
-      node.classList.toggle("sel", node.dataset.messageId === state.selectedMsgId);
-    }
+  for (const node of el.messagesInner.querySelectorAll(".msg")) {
+    node.classList.toggle("sel", node.dataset.messageId === state.selectedMsgId);
   }
 }
 
@@ -1588,6 +1944,10 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
+  // Let the native controls handle Space/Enter and range-seeking keys rather
+  // than treating them as chat navigation or a message send.
+  if (event.target.matches(".audio-toggle, .audio-progress") ||
+      (event.target.matches(".audio-speed") && (event.key === "Enter" || event.key === " "))) return;
 
   if (state.recording) {
     if (event.key === "Escape") {
@@ -1668,7 +2028,7 @@ document.addEventListener("keydown", (event) => {
     }
     if (event.key === "ArrowUp" && !el.input.value.includes("\n")) {
       event.preventDefault();
-      enterMessages();
+      enterMessages(true);
       return;
     }
     if (event.key === "ArrowDown" && !el.input.value.includes("\n")) {
@@ -1685,6 +2045,14 @@ document.addEventListener("keydown", (event) => {
   }
 
   if (state.pane === "messages") {
+    if (event.key === " " && !event.shiftKey) {
+      const msg = state.messages.find((m) => m.id === state.selectedMsgId);
+      if (msg && isAudioType(msg)) {
+        event.preventDefault();
+        if (!event.repeat) playAudio(msg);
+        return;
+      }
+    }
     if (event.key === "ArrowUp" || event.key === "k") {
       event.preventDefault();
       selectMessage(-1);
@@ -1700,14 +2068,14 @@ document.addEventListener("keydown", (event) => {
       }
       return;
     }
-    if (event.key === "ArrowLeft") {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
       event.preventDefault();
-      setPane("chats");
-      return;
-    }
-    if (event.key === "ArrowRight") {
-      event.preventDefault();
-      setPane("input");
+      const msg = state.messages.find((m) => m.id === state.selectedMsgId);
+      if (msg && isAudioType(msg)) {
+        changeAudioPlaybackRate(event.key === "ArrowRight" ? 1 : -1);
+      } else {
+        setPane(event.key === "ArrowLeft" ? "chats" : "input");
+      }
       return;
     }
     if (event.key === "Enter") {
@@ -1796,15 +2164,25 @@ el.messages.addEventListener("click", (event) => {
 });
 
 el.messages.addEventListener("scroll", () => {
-  // Any upward movement is the user taking over: kill the open-chat pin
-  // at once. Programmatic scrolls only ever go down (to the bottom), so
-  // a decrease can only be the user. The old "120px from bottom" check
-  // alone meant small scroll-ups never cleared the pin, and every image
-  // still loading yanked the view back down (blink, no movement).
+  // Any upward movement is the user taking over: release the stick at
+  // once. This is the ONLY thing that clears it — programmatic scrolls
+  // only ever go down (to the bottom), so a decrease can only be the user.
+  // Do NOT also clear when `!isNearBottom`: images expanding (or the pane
+  // shrinking when the composer focuses) grow scrollHeight without a user
+  // gesture, and that used to kill the pin the moment a new chat opened.
   const top = el.messages.scrollTop;
-  if (top < lastMsgTop - 2 || !isNearBottom(120)) state.pinBottom = false;
+  if (ignorePinRelease === 0 && top < lastMsgTop - 2) state.pinBottom = false;
   lastMsgTop = top;
 });
+
+if (typeof ResizeObserver === "function" && el.messagesInner) {
+  const pinOnResize = () => {
+    if (state.pinBottom) scrollToBottom();
+  };
+  const ro = new ResizeObserver(pinOnResize);
+  ro.observe(el.messages);
+  ro.observe(el.messagesInner);
+}
 
 el.composer.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -1887,6 +2265,7 @@ async function boot() {
   // is the parked card). Register the slide listeners BEFORE any network
   // await: a toggle in the first seconds must not be missed.
   if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen) {
+    await window.__TAURI__.event.listen("wkd-open-url", (event) => acceptQuickLink(event.payload));
     const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     window.__TAURI__.event.listen("quick-shown", () => {
       // ytm's rule, copied verbatim: never cancel() the card's animations.
@@ -1942,6 +2321,12 @@ async function boot() {
   el.chatList.setAttribute("tabindex", "0");
   el.messages.setAttribute("tabindex", "0");
   setPane("chats");
+  quickLinkReady = true;
+  try {
+    const initial = await invoke("get_pending_deep_link");
+    if (initial && !pendingQuickLink) pendingQuickLink = initial;
+  } catch (_) { /* event listener still handles warm links */ }
+  if (pendingQuickLink) acceptQuickLink(pendingQuickLink);
 
   setInterval(tick, 1500);
   setTimeout(() => refreshChats(), 600);

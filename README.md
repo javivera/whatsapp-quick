@@ -13,6 +13,29 @@ npm run install            # builds, signs locally, installs to /Applications
 open "/Applications/WhatsApp Quick.app"
 ```
 
+## Open Safari WhatsApp links in Quick
+
+The **Userscripts** Safari extension is already installed on this Mac. The
+script [`scripts/whatsapp-quick-safari.user.js`](scripts/whatsapp-quick-safari.user.js)
+was copied into its default scripts directory for this setup. After adding or changing the file, **open
+the Userscripts toolbar popup once** to reload scripts. If you selected a
+custom scripts directory in Userscripts, copy the file there instead.
+Enable the extension in Safari Settings → Extensions and grant it access to the
+websites where you click WhatsApp links (for links on any site, grant access to
+all websites). The script only acts on `https://wa.me/<phone>` and
+`https://api.whatsapp.com/send?phone=<phone>`; modified clicks and other URLs
+keep Safari's normal behavior. Safari may prompt once to allow opening Quick.
+Direct visits to those URLs also show an **Open in WhatsApp Quick** fallback
+button if automatic opening is blocked. Safari may hand universal links directly
+to another app before a page loads; the userscript cannot intercept those.
+
+The installed app registers `whatsapp-quick://send?phone=<international digits>&text=<optional draft>`.
+Links open the conversation and prefill the composer **without sending**. A
+number absent from recent chats gets a temporary chat entry; the bridge checks
+its WhatsApp identity when you actually send. Unsupported wa.me short codes
+(e.g. `/message/...`) are left alone. No system `whatsapp://` or HTTPS handler
+is replaced.
+
 ## Sharing the bridge (the important part)
 
 The bridge is `bridge_server.js` in this folder, bundled into this app
@@ -64,11 +87,17 @@ child handle, which killed the full app's bridge. Keep the ownership gate.
 | `↑` `↓` in an empty composer | jump back to the chat list |
 | `↵` in the composer | send (`⇧↵` for a newline) |
 | `⌘M` | start / stop + send a voice note |
-| `↵` on a message | open its link / media in the default app (voice notes play in-app) |
-| `m` on a message | open the message menu (reply / react / copy / delete…) |
+| `↵` on a message | open its action menu (open/play, reply, react, copy, delete for me) |
+| `Space` on a selected voice message | play / pause in-app (click its play button too) |
+| `←` / `→` on a selected voice message | decrease / increase playback speed (1×, 1.5×, 2×); click the speed badge to increase it |
+| `m` on a message | open the message menu (reply / react / copy / delete for me, with confirmation) |
 | `esc` | cancel recording → clear search → leave the composer → hide the palette |
 | `⌘⇧M` again / tray item | dismiss |
 | click another app, `⌘⇥` | dismiss (loses focus) |
+
+Deleting a message for yourself leaves a local “This message was deleted”
+placeholder at its original position, including after restarting Quick. The
+message content is not stored in that placeholder.
 
 There is also a menu-bar item (Show / Hide, Quit) because the app is an
 accessory (`LSUIElement`), so it has no Dock icon.

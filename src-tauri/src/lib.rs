@@ -17,6 +17,10 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 /// System-wide toggle for the palette.
 const DEFAULT_SHORTCUT: &str = "Command+Shift+M";
 
+/// AeroSpace id of the user's primary (wide) display. ⌘⇧M focuses this
+/// monitor first so the palette comes up on the screen they actually look at.
+const PRIMARY_AEROSPACE_MONITOR: &str = "2";
+
 /// A blur this soon after showing is key-status churn from being ordered front
 /// without activating the app, not the user clicking away.
 const BLUR_GRACE_MS: u64 = 700;
@@ -1493,6 +1497,36 @@ fn hide_quick_because<R: Runtime>(app: &AppHandle<R>, reason: &str) {
     }
 }
 
+/// Best-effort: switch AeroSpace to the primary monitor before the palette
+/// is ordered front. Must run *before* show, never after — a monitor change
+/// after makeKeyAndOrderFront steals key status and hide-on-blur dismisses us.
+/// A missing binary or a failed CLI must not block the show.
+fn focus_primary_monitor() {
+    #[cfg(target_os = "macos")]
+    {
+        let bin = if PathBuf::from("/opt/homebrew/bin/aerospace").is_file() {
+            "/opt/homebrew/bin/aerospace"
+        } else if PathBuf::from("/usr/local/bin/aerospace").is_file() {
+            "/usr/local/bin/aerospace"
+        } else {
+            "aerospace"
+        };
+        match Command::new(bin)
+            .args(["focus-monitor", PRIMARY_AEROSPACE_MONITOR])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!(
+                "quick: aerospace focus-monitor {PRIMARY_AEROSPACE_MONITOR} exited {status}"
+            ),
+            Err(err) => eprintln!("quick: aerospace focus-monitor failed: {err}"),
+        }
+    }
+}
+
 fn show_quick<R: Runtime>(app: &AppHandle<R>) {
     set_shown(app, true);
     if let Ok(mut flag) = app.state::<OverlayState>().was_focused.lock() {
@@ -1528,12 +1562,30 @@ fn show_quick<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit("quick-shown", ());
 }
 
+fn receive_quick_link<R: Runtime>(app: &AppHandle<R>, url: &tauri::Url) {
+    if url.scheme() != "whatsapp-quick" || url.host_str() != Some("send") || !matches!(url.path(), "" | "/") {
+        return;
+    }
+    let value = url.to_string();
+    let state = app.state::<AppState>();
+    *state.pending_deep_link.lock().unwrap() = Some(value.clone());
+    show_quick(app);
+    let _ = app.emit("wkd-open-url", value);
+}
+
 fn toggle_quick<R: Runtime>(app: &AppHandle<R>) {
     if is_shown(app) {
         hide_quick_because(app, "toggle");
     } else {
+        focus_primary_monitor();
         show_quick(app);
     }
+}
+
+/// Re-emit the show event after the WebView has subscribed to it on cold links.
+#[tauri::command]
+fn show_quick_cmd(app: AppHandle) {
+    show_quick(&app);
 }
 
 /// Called from the page (Esc) to dismiss the palette.
@@ -1850,7 +1902,8 @@ pub fn run() {
             get_pending_deep_link,
             log_debug,
             get_process_stats,
-            hide_quick_cmd
+            hide_quick_cmd,
+            show_quick_cmd
         ])
         .setup(|app| {
             // THIS is the ytm line we were missing. Without it Tauri keeps a
@@ -1942,19 +1995,19 @@ pub fn run() {
             }
             tray.build(app)?;
 
-            // Handle deep links (wkd:// scheme)
+            // The custom scheme belongs only to Quick; never claim WhatsApp's own URLs.
             let handle = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
-                    println!("[deep-link] Received URL: {url}");
-                    let url_str = url.to_string();
-                    // Store it so the frontend can fetch it on boot
-                    let state = handle.state::<AppState>();
-                    *state.pending_deep_link.lock().unwrap() = Some(url_str.clone());
-                    // Also emit in case the frontend is already loaded
-                    let _ = handle.emit("wkd-open-url", url_str);
+                    receive_quick_link(&handle, &url);
                 }
             });
+            // On macOS a launch URL may arrive before the WebView is ready.
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                for url in urls {
+                    receive_quick_link(app.handle(), &url);
+                }
+            }
 
             Ok(())
         })
